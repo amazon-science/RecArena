@@ -202,7 +202,7 @@ pyjwt==2.10.1
     # via lightning-cloud
 pyparsing==3.2.5
     # via torch-geometric
-pytest==9.0.2
+pytest==9.0.3
     # via hatch.envs.default
 python-dateutil==2.9.0.post0
     # via
