@@ -211,7 +211,7 @@ python-dateutil==2.9.0.post0
     #   botocore
     #   croniter
     #   pandas
-python-multipart==0.0.20
+python-multipart==0.0.26
     # via lightning-cloud
 pytz==2025.2
     # via pandas
