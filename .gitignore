@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Cython
+*.c
+*.cpp
+*.html
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ML/DL
+checkpoints/
+lightning_logs/
+wandb/
+mlruns/
+*.ckpt
+*.pt
+*.pth
+
+# Data
+*.csv
+*.parquet
+*.h5
+*.hdf5
+data/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Misc
+*.log
+.env
