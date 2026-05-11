@@ -305,7 +305,7 @@ tzdata==2025.3
     # via
     #   arrow
     #   pandas
-urllib3==2.6.2
+urllib3==2.7.0
     # via
     #   botocore
     #   lightning-cloud
