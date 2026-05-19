@@ -91,7 +91,7 @@ grpcio==1.76.0
     # via tensorboard
 h11==0.16.0
     # via uvicorn
-idna==3.11
+idna==3.15
     # via
     #   anyio
     #   requests
