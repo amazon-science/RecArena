@@ -246,7 +246,7 @@ scikit-learn==1.8.0
     # via hatch.envs.default
 scipy==1.16.3
     # via scikit-learn
-setuptools==80.9.0
+setuptools==83.0.0
     # via
     #   tensorboard
     #   torch
