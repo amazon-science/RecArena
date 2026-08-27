@@ -171,7 +171,7 @@ src/rec_arena/
 
 ## Hardware
 
-All experiments were conducted on NVIDIA A10G GPUs (24 GB VRAM) with AMD EPYC 7R32 CPUs and 768 GB RAM.
+All experiments were conducted on NVIDIA A10G GPUs (24 GB VRAM) with AMD EPYC 7R32 CPUs and 768 GB RAM. The experiment drivers use FP16 mixed precision and require a CUDA-capable GPU; data can be prepared on any machine.
 
 ## License
 
