@@ -38,10 +38,14 @@ class BPRMF(DeepModel):
 
         # User and item embeddings
         self.user_embedding = nn.Embedding(
-            self.config.num_users, self.config.embedding_dim
+            self.config.num_users,
+            self.config.embedding_dim,
+            sparse=self._sparse_embeddings,
         )
         self.item_embedding = nn.Embedding(
-            self.config.num_items, self.config.embedding_dim
+            self.config.num_items,
+            self.config.embedding_dim,
+            sparse=self._sparse_embeddings,
         )
 
         # Initialize embeddings with Xavier/Glorot initialization for better convergence

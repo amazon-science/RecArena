@@ -19,7 +19,7 @@ class RecMDataset:
         split_type: Literal[
             "leave_one_out", "random_user_split", "time_split"
         ] = "time_split",
-        s3_bucket: str = "music-ml-berlin",
+        s3_bucket: str = "example-account",
         s3_prefix: str = "recarena",
         cache_dir: Optional[str] = None,
     ):

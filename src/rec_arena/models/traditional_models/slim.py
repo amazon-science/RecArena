@@ -61,46 +61,53 @@ class SLIM(TraditionalModel):
             )
         
         self.user_item_matrix = X
-        
+
         # Initialize similarity matrix
         self.W = sp.lil_matrix((self.num_items, self.num_items), dtype=np.float32)
-        
-        # Train elastic net for each item
+
+        # Train elastic net for each item. precompute=True (cache the Gram
+        # matrix) and copy_X=False (fit in place on our masked column view) match
+        # RecBole's SLIMElastic and recover the ~5x speedup; without them sklearn
+        # copied X and recomputed the Gram every item.
         model = ElasticNet(
             alpha=self.alpha,
             l1_ratio=self.l1_ratio,
             positive=True,  # Non-negative weights
             fit_intercept=False,
+            copy_X=False,
+            precompute=True,
             max_iter=100,
             selection='random'
         )
-        
-        # Learn similarity for each item
+
+        # Fit each item's regression against the FULL matrix X (as CSC for fast
+        # column ops), zeroing only column j so item j can't predict itself
+        # (diag(W)=0). Previously this rebuilt X_{-j} via sp.hstack for EVERY
+        # item -- O(num_items * nnz) and the dominant SLIM cost. Masking a single
+        # column in place is O(nnz(col j)) and is the standard SLIM formulation
+        # (matches RecBole's SLIMElastic).
+        Xcsc = X.tocsc(copy=True).astype(np.float32)
         for j in range(self.num_items):
-            # Target: item j
-            y = X[:, j].toarray().ravel()
-            
-            # Features: all other items
-            start_idx = max(0, j - 1)
-            X_train = sp.hstack([X[:, :j], X[:, j+1:]], format='csr')
-            
-            # Skip if no interactions
+            # Target: item j (before masking).
+            y = Xcsc[:, j].toarray().ravel()
             if y.sum() == 0:
                 continue
-            
-            # Fit elastic net
-            model.fit(X_train, y)
-            
-            # Store non-zero weights
+
+            # Zero column j so it is excluded as a feature (self-similarity),
+            # fit, then restore the column for the next iteration.
+            col_start, col_end = Xcsc.indptr[j], Xcsc.indptr[j + 1]
+            saved = Xcsc.data[col_start:col_end].copy()
+            Xcsc.data[col_start:col_end] = 0.0
+
+            model.fit(Xcsc, y)
+
+            Xcsc.data[col_start:col_end] = saved  # restore
+
             w = model.coef_
             w_idx = np.where(w > 0)[0]
-            
-            # Adjust indices (account for removed column j)
-            w_idx_adjusted = np.where(w_idx < j, w_idx, w_idx + 1)
-            
-            self.W[w_idx_adjusted, j] = w[w_idx]
-        
-        # Convert to CSR for efficient operations
+            self.W[w_idx, j] = w[w_idx]
+
+        # Diagonal is already excluded (column j was zeroed during its own fit).
         self.W = self.W.tocsr()
     
     def _predict_numpy(self, user_ids: np.ndarray, item_ids: np.ndarray) -> np.ndarray:

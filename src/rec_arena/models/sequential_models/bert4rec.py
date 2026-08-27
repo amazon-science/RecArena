@@ -48,7 +48,7 @@ class BERT4Rec(DeepSequentialModel):
         self.mask_token_id = 2
 
         # Position embedding
-        position_config = getattr(config, 'position_config', {"type": "learnable"})
+        position_config = getattr(config, "position_config", {"type": "learnable"})
         if position_config["type"] == "rope":
             self.pos_embedding = None
         else:
@@ -64,6 +64,9 @@ class BERT4Rec(DeepSequentialModel):
             self.config.transformer_activation.lower(), nn.GELU()
         )
 
+        norm_eps = getattr(self.config, "layer_norm_eps", 1e-5)
+        use_bias = getattr(self.config, "use_bias", False)
+
         self.transformer_blocks = torch.nn.ModuleList(
             [
                 TransformerBlock(
@@ -75,14 +78,42 @@ class BERT4Rec(DeepSequentialModel):
                     causality=False,
                     use_swiglu=self.config.use_ligr,  # Use SwiGLU when LiGR mode enabled
                     use_gated_residual=self.config.use_ligr,  # Use gated residuals when LiGR mode enabled
+                    norm_first=getattr(self.config, "layer_norm_first", True),
+                    bias=use_bias,
+                    norm_eps=norm_eps,
                 )
                 for _ in range(self.config.num_layers)
             ]
         )
 
-        # Layer norm and dropout
-        self.layer_norm = nn.LayerNorm(self.embedding_dim)
+        # Optional input-embedding LayerNorm (RecBole-faithful; default off).
+        self.input_layer_norm = (
+            nn.LayerNorm(self.embedding_dim, eps=norm_eps)
+            if getattr(self.config, "input_layer_norm", False)
+            else None
+        )
+        # Final layer norm after blocks; suppressible for RecBole-faithful mode.
+        self.layer_norm = (
+            nn.LayerNorm(self.embedding_dim, eps=norm_eps)
+            if getattr(self.config, "final_layer_norm", True)
+            else None
+        )
         self.dropout = nn.Dropout(self.dropout_rate)
+
+        # Output prediction head (Linear -> GELU -> LayerNorm) applied to the
+        # encoder output before tied scoring, matching original BERT4Rec/RecBole.
+        if getattr(self.config, "output_head", False):
+            self.out_ffn = nn.Linear(self.embedding_dim, self.embedding_dim)
+            self.out_gelu = nn.GELU()
+            self.out_ln = nn.LayerNorm(self.embedding_dim, eps=norm_eps)
+        else:
+            self.out_ffn = None
+        # Learned per-item output bias (popularity prior) added to every logit.
+        self.out_bias = (
+            nn.Parameter(torch.zeros(self.vocab_size))
+            if getattr(self.config, "output_bias", False)
+            else None
+        )
 
         # Initialize weights properly (CRITICAL for convergence!)
         self._init_weights()
@@ -97,27 +128,56 @@ class BERT4Rec(DeepSequentialModel):
         hidden_states = self.get_hidden_states(sequences, attention_mask=attention_mask)
 
         # Project to vocabulary for masked prediction (use tied weights like SASRec)
-        logits = torch.matmul(hidden_states, self.item_embedding.weight.transpose(0, 1))
+        logits = torch.matmul(
+            hidden_states, self.get_output_embeddings().transpose(0, 1)
+        )
+        # Learned per-item bias (popularity prior), matching RecBole BERT4Rec.
+        if self.out_bias is not None:
+            logits = logits + self.out_bias
 
         return logits
 
     def predict_next(self, sequences, sequence_lengths):
-        """Predict next item probabilities."""
-        # For inference, mask the last position and predict
-        masked_sequences = sequences.clone()
-        batch_indices = torch.arange(sequences.size(0), device=sequences.device)
-        last_indices = torch.clamp(sequence_lengths - 1, min=0)
-        masked_sequences[batch_indices, last_indices] = self.mask_token_id
+        """Predict the next item, BERT4Rec-style.
 
-        # Create attention mask from masked sequences (not original)
-        # CRITICAL: mask_token_id is a valid token, should not be masked out
+        Per the paper, inference appends a ``[MASK]`` token to the END of the
+        sequence (position = sequence_length) and predicts that slot from its
+        final hidden state. This is different from masking the last *real* item
+        (which would reconstruct an already-seen interaction, not the next one).
+
+        When a sequence already fills ``max_seq_length``, we drop its oldest item
+        to make room for the trailing ``[MASK]`` (standard sliding-window eval).
+        """
+        batch_size, seq_len = sequences.size()
+        device = sequences.device
+        masked_sequences = sequences.clone()
+        batch_indices = torch.arange(batch_size, device=device)
+
+        # Append the MASK at index = sequence_length (one PAST the last real
+        # item), keeping ALL real items as context, so the MASK slot predicts the
+        # NEXT (held-out test) item -- the correct LOO next-item task. (We must
+        # NOT mask a real item at index length-1: that would destroy the last
+        # input item and ask the model to reconstruct it, but the eval target is
+        # the next item, not that one.) On overflow (seq already full), drop the
+        # oldest item to make room, mirroring RecBole's reconstruct_test_data.
+        mask_pos = sequence_lengths.clone()
+        overflow = mask_pos >= seq_len
+        if overflow.any():
+            masked_sequences[overflow] = torch.roll(
+                masked_sequences[overflow], shifts=-1, dims=1
+            )
+            mask_pos[overflow] = seq_len - 1
+        mask_pos = torch.clamp(mask_pos, 0, seq_len - 1)
+        masked_sequences[batch_indices, mask_pos] = self.mask_token_id
+
+        # MASK is a valid token; attend over all non-padding positions.
         attention_mask = masked_sequences != 0
         logits = self.forward(masked_sequences, attention_mask=attention_mask)
 
-        # Get predictions for the last position
-        last_logits = logits[batch_indices, last_indices]  # [batch_size, vocab_size]
+        # Predictions at the appended MASK position.
+        last_logits = logits[batch_indices, mask_pos]  # [batch_size, vocab_size]
 
-        # Remove padding token and mask token from predictions
+        # Remove special tokens from predictions.
         last_logits[:, 0] = -float("inf")  # PAD
         last_logits[:, 1] = -float("inf")  # UNK
         last_logits[:, 2] = -float("inf")  # MASK
@@ -144,13 +204,43 @@ class BERT4Rec(DeepSequentialModel):
         return sequence_embeddings
 
     def mask_sequences(self, sequences, mask_prob=None):
-        """Apply BERT-style masking to sequences for external loss functions."""
+        """Apply BERT-style masking to sequences for external loss functions.
+
+        In addition to the random Cloze masking, for a fraction of sequences we
+        force-mask the LAST real item (``last_item_mask_prob``). Training
+        otherwise only masks interior positions (which have both left and right
+        context), while inference always predicts a trailing ``[MASK]`` with
+        left context only -- a train/eval mismatch that hurts next-item ranking.
+        This auxiliary task (from the BERT4Rec paper) closes that gap.
+        """
         if mask_prob is None:
             mask_prob = self.config.mask_prob
 
         masked_sequences = sequences.clone()
         labels = torch.full_like(sequences, -100)  # -100 is ignored in loss
 
+        # RecBole-faithful masking: a BATCH-LEVEL mutually-exclusive switch (NOT
+        # a superposition). With prob last_item_mask_prob (== RecBole ft_ratio),
+        # the WHOLE batch does PURE last-item masking -- mask only each seq's
+        # final real item, intact left context -- which is EXACTLY the eval task
+        # (predict a trailing MASK from left context). Otherwise the whole batch
+        # does PURE interior Cloze. The two never mix in one forward pass; mixing
+        # them (the prior behavior) meant the model never cleanly trained the
+        # eval task, since last-item-masked seqs also had interior items masked.
+        # Mirrors RecBole transform.py:138-140 (batch coin flip) + _append_mask_last.
+        last_prob = getattr(self.config, "last_item_mask_prob", 0.0)
+        if last_prob > 0 and float(torch.rand(1).item()) < last_prob:
+            lengths = (sequences != 0).sum(dim=1)  # real length per row
+            last_idx = torch.clamp(lengths - 1, min=0)
+            rows = torch.arange(sequences.size(0), device=sequences.device)
+            has_items = lengths > 0
+            r = rows[has_items]
+            c = last_idx[has_items]
+            labels[r, c] = torch.clamp(sequences[r, c], 0, self.vocab_size - 1)
+            masked_sequences[r, c] = self.mask_token_id
+            return masked_sequences, labels
+
+        # --- else: PURE interior Cloze masking ---
         # Create random mask (don't mask padding tokens)
         mask_prob_matrix = torch.rand(sequences.shape, device=sequences.device)
         padding_mask = sequences == 0  # PAD_TOKEN = 0
@@ -158,15 +248,40 @@ class BERT4Rec(DeepSequentialModel):
         mask_prob_matrix.masked_fill_(padding_mask, 1.0)
 
         masked_indices = mask_prob_matrix < mask_prob
+
+        # Mask FLOOR: guarantee >=1 masked position per non-empty sequence. With
+        # pure Bernoulli(mask_prob=0.2) on short ml-100k sequences, some rows get
+        # ZERO masked positions -> that example contributes no loss, weakening
+        # the per-batch signal and adding large seed variance. For each non-empty
+        # row with no mask, force one uniformly-random real (non-PAD) position.
+        real = ~padding_mask
+        no_mask = real.any(dim=1) & (~masked_indices.any(dim=1))
+        if no_mask.any():
+            # Pick a random real position per offending row via argmax on random
+            # scores restricted to real positions.
+            scores = torch.rand(sequences.shape, device=sequences.device)
+            scores.masked_fill_(padding_mask, -1.0)
+            pick = scores.argmax(dim=1)  # [batch] a real col per row
+            rows = torch.arange(sequences.size(0), device=sequences.device)[no_mask]
+            masked_indices[rows, pick[no_mask]] = True
+
         # Clamp labels to valid vocab range
         valid_tokens = torch.clamp(sequences[masked_indices], 0, self.vocab_size - 1)
         labels[masked_indices] = valid_tokens
 
-        # mask_token_prob% of the time, replace with [MASK] token
+        # mask_token_prob% of the time, replace with [MASK] token.
+        # dtype=float is REQUIRED: labels.shape comes from a Long tensor and
+        # torch.bernoulli needs a float probability tensor. A float fill value
+        # (e.g. 0.8) happens to infer float, but an int fill value (e.g. the
+        # random_prob=0 branch below when mask_token_prob==1.0) would infer Long
+        # and crash bernoulli. Pin float explicitly on both.
         indices_replaced = (
             torch.bernoulli(
                 torch.full(
-                    labels.shape, self.config.mask_token_prob, device=sequences.device
+                    labels.shape,
+                    float(self.config.mask_token_prob),
+                    device=sequences.device,
+                    dtype=torch.float,
                 )
             ).bool()
             & masked_indices
@@ -178,11 +293,16 @@ class BERT4Rec(DeepSequentialModel):
         random_prob = (
             self.config.random_token_prob / (1 - self.config.mask_token_prob)
             if self.config.mask_token_prob < 1
-            else 0
+            else 0.0
         )
         indices_random = (
             torch.bernoulli(
-                torch.full(labels.shape, random_prob, device=sequences.device)
+                torch.full(
+                    labels.shape,
+                    float(random_prob),
+                    device=sequences.device,
+                    dtype=torch.float,
+                )
             ).bool()
             & masked_indices
             & ~indices_replaced
@@ -199,7 +319,7 @@ class BERT4Rec(DeepSequentialModel):
 
     def get_hidden_states(self, sequences, sequence_lengths=None, attention_mask=None):
         """Get hidden states from BERT transformer.
-        
+
         Args:
             sequences: [batch, seq_len] input sequences
             sequence_lengths: [batch] lengths (optional, for compatibility)
@@ -211,8 +331,8 @@ class BERT4Rec(DeepSequentialModel):
         item_embs = self.item_embedding(sequences)
 
         # Scale embeddings by sqrt(d) BEFORE adding position embeddings
-        if getattr(self.config, 'scale_embeddings', True):
-            item_embs = item_embs * (self.embedding_dim ** 0.5)
+        if getattr(self.config, "scale_embeddings", True):
+            item_embs = item_embs * (self.embedding_dim**0.5)
 
         # Position embeddings (clamp to max_seq_length)
         if self.pos_embedding is not None:
@@ -227,12 +347,15 @@ class BERT4Rec(DeepSequentialModel):
             x = item_embs + pos_embs
         else:
             x = item_embs
+        # RecBole-faithful: LayerNorm the input embeddings before dropout.
+        if self.input_layer_norm is not None:
+            x = self.input_layer_norm(x)
         x = self.dropout(x)
 
         # Create attention mask if not provided (True for valid positions, False for padding)
         if attention_mask is None:
             attention_mask = sequences != 0  # [batch_size, seq_len] - keep as bool
-        
+
         # Ensure mask is boolean (don't convert to float - MHA module handles that)
         if attention_mask.dtype not in [torch.bool]:
             attention_mask = attention_mask.bool()
@@ -241,16 +364,46 @@ class BERT4Rec(DeepSequentialModel):
         for block in self.transformer_blocks:
             x = block(x, attn_mask=attention_mask)
 
-        x = self.layer_norm(x)
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+        # Output prediction head (Linear -> GELU -> LayerNorm) before tied
+        # scoring. Applied here so both forward() and compute_loss() (which both
+        # call get_hidden_states) share the same scoring representation.
+        if self.out_ffn is not None:
+            x = self.out_ln(self.out_gelu(self.out_ffn(x)))
         return x
 
     def _init_weights(self):
-        """Initialize weights to prevent NaN and ensure proper convergence."""
-        # Initialize item embeddings with small std like SASRec
-        nn.init.normal_(self.item_embedding.weight, std=0.02)
-        # Initialize position embeddings with small std
-        if self.pos_embedding is not None:
-            nn.init.normal_(self.pos_embedding.weight, std=0.02)
+        """Initialize ALL modules like RecBole BERT4Rec (self.apply(_init_weights),
+        bert4rec.py:97-107): every nn.Linear and nn.Embedding weight ~ N(0, std),
+        Linear/LayerNorm biases zeroed, LayerNorm weight = 1.
+
+        Previously only the item/position embeddings were initialized; the whole
+        transformer encoder (qkv/out projections, FFN linears), the output head
+        (out_ffn/out_ln), and input_layer_norm were left at PyTorch defaults --
+        nn.Linear defaults to kaiming_uniform_(a=sqrt(5)) (std ~1/sqrt(fan_in)
+        ~= 0.125 here, ~6x RecBole's 0.02) with uniform-random biases. That
+        degraded the from-scratch optimum and made results highly seed-sensitive.
+        The weight-parity test could never catch this: it copies RecBole's
+        TRAINED weights in, bypassing init entirely.
+        """
+        std = getattr(self.config, "init_std", 0.02)
+
+        def _init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        self.apply(_init)
+        # Keep the PAD row of the item embedding at zero (padding_idx semantics).
+        with torch.no_grad():
+            self.item_embedding.weight[0].zero_()
 
     def compute_loss(self, batch):
         """Compute loss for BERT4Rec - uses masked prediction (not causal).
@@ -280,25 +433,42 @@ class BERT4Rec(DeepSequentialModel):
         # labels has -100 for non-masked positions, valid item IDs for masked positions
         mask = (labels != -100).float()
 
-        # Padding (0) should be ignored, keep -100 as -100 for ignore_index
-        # Valid targets stay 1-indexed to match logits
-        # CRITICAL: Clamp targets to valid vocab range to prevent CUDA assertion errors
+        # Non-masked positions are excluded two ways: (1) the `mask` zeroes
+        # their per-token loss, and (2) we set their target to 0 (PAD) which the
+        # CE loss treats as ignore_index. (Using -100 here would crash CE whose
+        # ignore_index is 0, not -100.) Sampled losses rely on `mask` only.
         targets = torch.where(
-            labels == -100, 
-            torch.tensor(-100, device=labels.device), 
-            torch.clamp(labels, 0, self.vocab_size - 1)
+            labels == -100,
+            torch.zeros_like(labels),
+            torch.clamp(labels, 0, self.vocab_size - 1),
         )
 
         # Extract negative samples if present
         neg_items = batch.get("neg_items")
         # Note: neg_items don't need shifting for BERT4Rec (in-place prediction)
 
-        # Call loss function with hidden states for fast sampled logits
-        # Loss functions will use fast path if they support it
+        # Call loss function with hidden states for fast sampled logits.
+        # embedding_lookup is passed only for sparse tables (sampled losses).
+        extra = {}
+        lookup = self.embedding_lookup()
+        if lookup is not None:
+            extra["embedding_lookup"] = lookup
+        # Thread the learned per-item output bias into the TRAINING logits so it
+        # is trained, not just applied at inference (forward()/predict_next()).
+        # RecBole BERT4Rec adds this bias in BOTH calculate_loss and
+        # full_sort_predict. Only the full-softmax CrossEntropyLoss path forms
+        # logits here and accepts the output_bias kwarg; sampled losses form
+        # their own (sampled) logits and are left unchanged.
+        if self.out_bias is not None:
+            from ...losses.sequential.cross_entropy import CrossEntropyLoss
+
+            if isinstance(self.loss_fn, CrossEntropyLoss):
+                extra["output_bias"] = self.out_bias
         return self.loss_fn(
             hidden_states=hidden_states,
-            item_embeddings=self.item_embedding.weight,
+            item_embeddings=self.get_output_embeddings(),
             targets=targets,
             mask=mask,
             neg_items=neg_items,
+            **extra,
         )

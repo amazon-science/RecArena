@@ -29,12 +29,12 @@ def prepare_implicit_interactions(df: pd.DataFrame) -> List[Dict]:
     If 'implicit' column exists, filter to implicit==1.
     Otherwise, treat all interactions as positive (already implicit feedback).
 
-    Note: Converts item_ids from 1-indexed (data convention) to 0-indexed (model convention).
-    This matches the library standard where:
-    - Data stores items as [1, 2, 3, ..., N]
-    - Models expect embedding indices [0, 1, 2, ..., N-1]
-    - Sequential models handle this via _to_model_indices() during evaluation
-    - Implicit models need conversion at dataset level since they embed directly
+    Item ids are kept exactly as produced by the dataset loader, which maps
+    items to a 3-indexed space ([3, N+2]; PAD/UNK/MASK occupy 0/1/2) -- the same
+    convention sequential models use. Implicit models therefore size their item
+    embedding table to N+3 and use the id directly as the embedding/column
+    index, keeping positives, negatives (sampled over [3, N+2]) and held-out
+    targets on one consistent convention.
     """
     interactions = []
 
@@ -49,8 +49,7 @@ def prepare_implicit_interactions(df: pd.DataFrame) -> List[Dict]:
         interactions.append(
             {
                 "user_id": int(row["user_id"]),
-                "item_id": int(row["item_id"])
-                - 1,  # Convert to 0-indexed for model embeddings
+                "item_id": int(row["item_id"]),  # 3-indexed (direct column index)
             }
         )
 

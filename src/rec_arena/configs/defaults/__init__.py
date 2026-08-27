@@ -9,9 +9,12 @@ from .twotower import TwoTowerConfig
 from .bprmf import BPRMFConfig
 from .fmlprec import FMLPRecConfig
 from .mlp4rec import MLP4RecConfig
+from .sasrec_pack import SASRecPackConfig
 from .hstu import HSTUConfig
 from .fuxi import FuXiConfig
 from .fuxi_gamma import FuXiGammaConfig
+from .fuxi_linear import FuXiLinearConfig
+from .fuxi_beta import FuXiBetaConfig
 
 
 __all__ = [
@@ -24,7 +27,10 @@ __all__ = [
     "BPRMFConfig",
     "FMLPRecConfig",
     "MLP4RecConfig",
+    "SASRecPackConfig",
     "HSTUConfig",
     "FuXiConfig",
     "FuXiGammaConfig",
+    "FuXiLinearConfig",
+    "FuXiBetaConfig",
 ]

@@ -16,7 +16,9 @@ class SampledSoftmaxLoss(nn.Module):
     - neg_items: [batch, seq_len, num_neg] or [batch, num_neg] (required)
     """
 
-    def __init__(self, ignore_index: int = -1, temperature: float = 1.0, l2_norm: bool = False):
+    def __init__(
+        self, ignore_index: int = -1, temperature: float = 1.0, l2_norm: bool = False
+    ):
         super().__init__()
         self.cross_entropy = nn.CrossEntropyLoss(
             ignore_index=ignore_index, reduction="none"
@@ -24,8 +26,16 @@ class SampledSoftmaxLoss(nn.Module):
         self.temperature = temperature
         self.l2_norm = l2_norm
 
-    def __call__(self, logits=None, targets=None, mask=None, neg_items=None,
-                 hidden_states=None, item_embeddings=None):
+    def __call__(
+        self,
+        logits=None,
+        targets=None,
+        mask=None,
+        neg_items=None,
+        hidden_states=None,
+        item_embeddings=None,
+        embedding_lookup=None,
+    ):
         """Compute sampled softmax loss.
 
         Args:
@@ -35,6 +45,9 @@ class SampledSoftmaxLoss(nn.Module):
             neg_items: [batch, seq_len, num_neg] or [batch, num_neg] (required)
             hidden_states: [batch, seq_len, dim] (optional, for fast path)
             item_embeddings: [vocab_size, dim] (optional, for fast path)
+            embedding_lookup: optional callable ids->emb. When provided, item
+                embeddings are gathered via a module forward (so gradients stay
+                sparse for SparseAdam) instead of indexing item_embeddings.
 
         Returns:
             Scalar loss value
@@ -44,40 +57,59 @@ class SampledSoftmaxLoss(nn.Module):
                 "Sampled Softmax requires negative samples in neg_items parameter"
             )
 
-        batch_size, seq_len = targets.shape if targets.dim() == 2 else (targets.shape[0], 1)
+        batch_size, seq_len = (
+            targets.shape if targets.dim() == 2 else (targets.shape[0], 1)
+        )
 
         # Fast path: compute sampled logits directly from hidden states
         if hidden_states is not None and item_embeddings is not None:
+            # Sparse-safe lookup: a module forward keeps gradients sparse;
+            # plain tensor indexing (default) yields dense gradients.
+            lookup = (
+                embedding_lookup
+                if embedding_lookup is not None
+                else (lambda ids: item_embeddings[ids])
+            )
             # Apply L2 normalization if enabled
             if self.l2_norm:
-                hidden_states = torch.nn.functional.normalize(hidden_states, p=2, dim=-1)
-                item_embeddings = torch.nn.functional.normalize(item_embeddings, p=2, dim=-1)
-            
+                hidden_states = torch.nn.functional.normalize(
+                    hidden_states, p=2, dim=-1
+                )
+
             # Gather embeddings for positive and negative items
-            pos_emb = item_embeddings[targets]  # [batch, seq_len, dim]
-            
+            pos_emb = lookup(targets)  # [batch, seq_len, dim]
+            if self.l2_norm:
+                pos_emb = torch.nn.functional.normalize(pos_emb, p=2, dim=-1)
+
             # Compute positive scores
-            pos_scores = (hidden_states * pos_emb).sum(dim=-1, keepdim=True)  # [batch, seq_len, 1]
-            
+            pos_scores = (hidden_states * pos_emb).sum(
+                dim=-1, keepdim=True
+            )  # [batch, seq_len, 1]
+
             # Handle negative items (2D or 3D)
+            neg_emb = lookup(neg_items)
+            if self.l2_norm:
+                neg_emb = torch.nn.functional.normalize(neg_emb, p=2, dim=-1)
             if neg_items.dim() == 3:
-                # Per-position negatives: [batch, seq_len, num_neg]
-                neg_emb = item_embeddings[neg_items]  # [batch, seq_len, num_neg, dim]
-                neg_scores = torch.einsum('bsd,bsnd->bsn', hidden_states, neg_emb)  # [batch, seq_len, num_neg]
+                # Per-position negatives: [batch, seq_len, num_neg, dim]
+                neg_scores = torch.einsum(
+                    "bsd,bsnd->bsn", hidden_states, neg_emb
+                )  # [batch, seq_len, num_neg]
             elif neg_items.dim() == 2:
-                # Global negatives: [batch, num_neg]
-                neg_emb = item_embeddings[neg_items]  # [batch, num_neg, dim]
-                neg_scores = torch.einsum('bsd,bnd->bsn', hidden_states, neg_emb)  # [batch, seq_len, num_neg]
+                # Global negatives: [batch, num_neg, dim]
+                neg_scores = torch.einsum(
+                    "bsd,bnd->bsn", hidden_states, neg_emb
+                )  # [batch, seq_len, num_neg]
             else:
                 raise ValueError(f"Unexpected neg_items shape: {neg_items.shape}")
-            
+
             # Apply temperature scaling
             pos_scores = pos_scores / self.temperature
             neg_scores = neg_scores / self.temperature
-            
+
             # Combine: [batch, seq_len, 1 + num_neg]
             combined_scores = torch.cat([pos_scores, neg_scores], dim=-1)
-        
+
         # Slow path: use pre-computed logits (backward compatible)
         elif logits is not None:
             # Gather positive scores

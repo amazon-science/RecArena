@@ -3,7 +3,13 @@ import torch.nn as nn
 
 
 class LayerNorm(nn.Module):
-    """Layer normalization layer."""
+    """Layer normalization (matches torch.nn.LayerNorm semantics).
+
+    Normalizes over the last dimension using the (biased) variance with eps
+    inside the square root: (x - mean) / sqrt(var + eps). This matches PyTorch's
+    nn.LayerNorm; the previous implementation used std with eps *outside* the
+    sqrt, which is numerically different and unstable for small variance.
+    """
 
     def __init__(self, d_model: int, eps: float = 1e-5):
         super().__init__()
@@ -13,8 +19,8 @@ class LayerNorm(nn.Module):
 
     def forward(self, x):
         mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        output = (x - mean) / (std + self.eps)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        output = (x - mean) / torch.sqrt(var + self.eps)
         output = output * self.weight + self.bias
         return output
 
@@ -59,7 +65,9 @@ class InstanceNorm(nn.Module):
         mean = x.mean(dim=(2, 3), keepdim=True)
         var = x.var(dim=(2, 3), keepdim=True)
         output = (x - mean) / torch.sqrt(var + self.eps)
-        output = output * self.weight.unsqueeze(0).unsqueeze(2) + self.bias.unsqueeze(0).unsqueeze(2)
+        output = output * self.weight.unsqueeze(0).unsqueeze(2) + self.bias.unsqueeze(
+            0
+        ).unsqueeze(2)
         return output
 
 
@@ -80,7 +88,9 @@ class GroupNorm(nn.Module):
         var = x.var(dim=-1, keepdim=True)
         output = (x - mean) / torch.sqrt(var + self.eps)
         output = output.view(b, c, h, w)
-        output = output * self.weight.unsqueeze(0).unsqueeze(2).unsqueeze(3) + self.bias.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+        output = output * self.weight.unsqueeze(0).unsqueeze(2).unsqueeze(
+            3
+        ) + self.bias.unsqueeze(0).unsqueeze(2).unsqueeze(3)
         return output
 
 

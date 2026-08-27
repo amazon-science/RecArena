@@ -36,24 +36,67 @@ class SASRec(DeepSequentialModel):
         super().__init__(config)
         self.save_hyperparameters()
 
-        # Position encoding (learnable or RoPE)
+        # Position encoding. Supported types:
+        #   "learnable" : additive learnable absolute embedding (SASRec default)
+        #   "rope"      : rotary position embedding (order only)
+        #   "to_rope"   : Time-and-Order RoPE (rotary over order + wall-clock time)
+        #   "alibi"     : additive linear-bias attention (parameter-free)
+        #   "t5_rab"    : learnable bucketed relative-position attention bias
+        # The last two produce a per-head additive attention bias (self.pos_bias);
+        # the rotary types produce self.rope; "learnable" produces pos_embedding.
         position_config = getattr(self.config, 'position_config', {"type": "learnable"})
-        if position_config["type"] == "rope":
+        pos_type = position_config["type"]
+        head_dim = self.embedding_dim // self.config.num_heads
+
+        self.rope = None
+        self.pos_embedding = None
+        self.pos_bias = None
+        self._uses_time = pos_type == "to_rope"
+
+        if pos_type == "rope":
             from ...modules.layer_utils.embeddings import RotaryPositionalEmbedding
             self.rope = RotaryPositionalEmbedding(
-                dim=self.embedding_dim // self.config.num_heads,
+                dim=head_dim,
                 max_seq_len=self.config.max_seq_length,
-                base=position_config.get("base", 10000)
+                base=position_config.get("base", 10000),
             )
-            self.pos_embedding = None
-        else:
+        elif pos_type == "to_rope":
+            from ...modules.layer_utils.embeddings import TimeOrderRotaryEmbedding
+            self.rope = TimeOrderRotaryEmbedding(
+                dim=head_dim,
+                max_seq_len=self.config.max_seq_length,
+                base=position_config.get("base", 10000),
+                time_ratio=position_config.get("time_ratio", 0.5),
+                time_scale=position_config.get("time_scale", 1.0),
+            )
+        elif pos_type == "alibi":
+            from ...modules.transformer_layers.position_bias import ALiBiBias
+            self.pos_bias = ALiBiBias(
+                num_heads=self.config.num_heads,
+                max_seq_len=self.config.max_seq_length,
+            )
+        elif pos_type == "t5_rab":
+            from ...modules.transformer_layers.position_bias import (
+                T5RelativeAttentionBias,
+            )
+            self.pos_bias = T5RelativeAttentionBias(
+                num_heads=self.config.num_heads,
+                max_seq_len=self.config.max_seq_length,
+                num_buckets=position_config.get("num_buckets", 32),
+                max_distance=position_config.get("max_distance", 128),
+            )
+        else:  # "learnable"
             self.pos_embedding = nn.Embedding(
                 self.config.max_seq_length, self.embedding_dim
             )
             nn.init.normal_(self.pos_embedding.weight, std=0.02)
-            self.rope = None
 
         activation = self._get_activation()
+        qk_norm = getattr(self.config, "use_qk_norm", False)
+        peri_norm = getattr(self.config, "use_peri_norm", False)
+
+        norm_eps = getattr(self.config, "layer_norm_eps", 1e-5)
+        use_bias = getattr(self.config, "use_bias", False)
 
         self.transformer_blocks = torch.nn.ModuleList(
             [
@@ -68,13 +111,30 @@ class SASRec(DeepSequentialModel):
                     use_gated_residual=self.config.use_ligr,
                     norm_first=self.config.layer_norm_first,
                     rope=self.rope,
+                    qk_norm=qk_norm,
+                    pos_bias=self.pos_bias,
+                    peri_norm=peri_norm,
+                    bias=use_bias,
+                    norm_eps=norm_eps,
                 )
                 for _ in range(self.config.num_layers)
             ]
         )
 
-        # Final layer norm (applied after all transformer blocks)
-        self.layer_norm = nn.LayerNorm(self.embedding_dim)
+        # Optional LayerNorm on the input embeddings (RecBole-faithful mode).
+        # Default off: RecArena has historically applied no input LN.
+        self.input_layer_norm = (
+            nn.LayerNorm(self.embedding_dim, eps=norm_eps)
+            if getattr(self.config, "input_layer_norm", False)
+            else None
+        )
+        # Final layer norm after all transformer blocks. Suppressible so a run
+        # can match RecBole SASRec (which has none). Default on (current behavior).
+        self.layer_norm = (
+            nn.LayerNorm(self.embedding_dim, eps=norm_eps)
+            if getattr(self.config, "final_layer_norm", True)
+            else None
+        )
         # Input dropout (applied to embeddings)
         self.dropout = nn.Dropout(self.config.dropout_rate)
 
@@ -180,19 +240,34 @@ class SASRec(DeepSequentialModel):
             pos_embs = self.pos_embedding(positions)
             x = item_embs + pos_embs
         else:
-            # RoPE is applied in attention layers
+            # RoPE / TO-RoPE / additive-bias position encodings act inside the
+            # attention layers, so no additive input embedding here.
             x = item_embs
-        
+
+        # RecBole-faithful: LayerNorm the input embeddings before dropout.
+        if self.input_layer_norm is not None:
+            x = self.input_layer_norm(x)
+
         x = self.dropout(x)
+
+        # TO-RoPE consumes real interaction timestamps (falls back to positions
+        # when unavailable). Other position types ignore this.
+        timestamps = None
+        if self._uses_time:
+            timestamps = self.get_batch_timestamps()
+            if timestamps is not None:
+                timestamps = timestamps.to(sequences.device).float()
 
         # CRITICAL: Don't pass padding mask when using causal attention
         # The is_causal flag is ignored when attn_mask is provided!
         # Apply transformer blocks with causal attention only
         for block in self.transformer_blocks:
-            x = block(x, attn_mask=None)
+            x = block(x, attn_mask=None, timestamps=timestamps)
 
-        # Apply final layer norm before output projection
-        x = self.layer_norm(x)
+        # Apply final layer norm before output projection (suppressible for
+        # RecBole-faithful mode, which has no post-encoder LayerNorm).
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
 
         return x
 

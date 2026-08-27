@@ -1,4 +1,4 @@
-"""Shared fixtures and hypothesis strategies for the rec_arena test suite."""
+"""Shared fixtures and hypothesis strategies for the recarena test suite."""
 
 import pandas as pd
 import pytest

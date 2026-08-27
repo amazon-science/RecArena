@@ -36,6 +36,21 @@ class PyGLightGCN(GraphModel):
         
         return user_emb, item_emb
     
+    def get_user_embedding(self, user_ids: torch.Tensor) -> torch.Tensor:
+        """Post-convolution user embeddings for `user_ids`.
+
+        Lets the implicit benchmark adapter score users via a single
+        user x all-items matmul (its fast full-sort path) instead of the
+        per-pair predict() expansion.
+        """
+        user_emb, _ = self.compute_graph_embeddings()
+        return user_emb[torch.clamp(user_ids, 0, self.num_users - 1)]
+
+    def get_item_embedding(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """Post-convolution item embeddings for `item_ids` (3-indexed == column)."""
+        _, item_emb = self.compute_graph_embeddings()
+        return item_emb[torch.clamp(item_ids, 0, self.num_items - 1)]
+
     def predict(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
         """Predict scores for user-item pairs."""
         user_emb, item_emb = self.compute_graph_embeddings()

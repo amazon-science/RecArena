@@ -92,24 +92,48 @@ class ItemKNN(TraditionalModel):
         else:
             raise ValueError(f"Unknown similarity: {self.similarity}")
         
-        # Keep only top-k neighbors per item
-        if self.k < self.num_items:
-            # Zero out all but top-k similarities
-            for i in range(self.num_items):
-                row = self.similarity_matrix[i]
-                top_k_idx = np.argpartition(row, -self.k)[-self.k:]
-                mask = np.ones(self.num_items, dtype=bool)
-                mask[top_k_idx] = False
-                self.similarity_matrix[i, mask] = 0
-        
-        # Set diagonal to zero (no self-similarity)
+        # Set diagonal to zero (no self-similarity) BEFORE top-k selection.
+        # Otherwise each item's own self-similarity (=1.0, always the largest)
+        # occupies a top-k slot that then gets zeroed, leaving only k-1 real
+        # neighbors. RecBole zeroes self first (compute_similarity), keeping a
+        # full k neighbors -- matching that avoids an off-by-one neighbor count.
         np.fill_diagonal(self.similarity_matrix, 0)
-        
-        # Normalize if requested
+
+        # Keep only top-k neighbors, truncated PER COLUMN.
+        #
+        # Scoring is `user_vectors @ similarity_matrix`, i.e.
+        #   score(u, j) = sum_i X[u,i] * S[i,j].
+        # Standard item-based CF (Sarwar et al. 2001) scores a TARGET item j from
+        # ITS k nearest neighbours in the user's history:
+        #   score(u, j) = sum_{i in KNN(j)} X[u,i] * sim(i,j),
+        # so column j of S must hold item j's neighbours -> top-k PER COLUMN.
+        # Truncating per ROW (the previous behaviour) keeps "items for which j is
+        # a neighbour", a different, non-standard quantity, and produced a large
+        # ranking discrepancy vs RecBole / the literature. The pre-truncation
+        # cosine matrix is symmetric, so per-column truncation matches RecBole's
+        # ComputeSimilarity exactly (up to tie-breaking on equal similarities).
+        if self.k < self.num_items:
+            S = self.similarity_matrix
+            keep = np.zeros_like(S, dtype=bool)
+            for j in range(self.num_items):
+                col = S[:, j]
+                top_k_idx = np.argpartition(col, -self.k)[-self.k:]
+                keep[top_k_idx, j] = True
+            S[~keep] = 0
+            self.similarity_matrix = S
+
+        # Normalize if requested. Normalize PER COLUMN to match the per-column
+        # neighbour truncation (each target item's neighbour weights sum to 1).
+        #
+        # NOTE: this path defaults to OFF (config normalize=False). Column-sum
+        # normalization rescales each target item's column independently, which
+        # is NOT rank-preserving across target items and diverges from standard
+        # item-based CF (Sarwar et al. 2001) / RecBole, whose convention is
+        # UNNORMALIZED neighbour weights. Kept available for explicit opt-in.
         if self.normalize:
-            row_sums = self.similarity_matrix.sum(axis=1, keepdims=True)
-            row_sums[row_sums == 0] = 1  # Avoid division by zero
-            self.similarity_matrix = self.similarity_matrix / row_sums
+            col_sums = self.similarity_matrix.sum(axis=0, keepdims=True)
+            col_sums[col_sums == 0] = 1  # Avoid division by zero
+            self.similarity_matrix = self.similarity_matrix / col_sums
     
     def _predict_numpy(self, user_ids: np.ndarray, item_ids: np.ndarray) -> np.ndarray:
         """Predict scores for user-item pairs."""

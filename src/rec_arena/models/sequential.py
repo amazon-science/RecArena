@@ -86,6 +86,12 @@ class SequentialModel(BaseModel):
 class DeepSequentialModel(SequentialModel, pl.LightningModule):
     """Base class for deep learning sequential models using PyTorch Lightning."""
 
+    # Whether this model has a sparse-safe loss path (gradients on the item
+    # table stay sparse). True for the base causal path (sampled losses gather
+    # via embedding_lookup). Models whose compute_loss only forms full-vocab
+    # logits (dense table gradient) override this to False.
+    SUPPORTS_SPARSE = True
+
     def __init__(self, config: Dict[str, Any]):
         # Validate configuration for sequential models
         validate_config(config, "sequential")
@@ -109,35 +115,86 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
         self._metric_calculator = None
         self._last_val_ndcg = 0.0  # Cache last computed NDCG for early stopping
         self._compute_metrics_this_epoch = False  # Flag to track if we computed metrics
+        # Per-user TRAIN-history table [num_users, Lmax] of 3-indexed item ids
+        # (pad 0), populated by the harness via set_eval_history. Used to mask a
+        # user's already-seen items during VALIDATION metric computation so the
+        # monitored val NDCG matches the reported test full-sort protocol.
+        self._val_hist_ids = None
 
         # Loss function (can be set externally or from config)
         self.loss_fn = config.get("loss_fn", None)
+
+        # Holds the current batch's real interaction timestamps so time-aware
+        # models (HSTU time bias, FuXi-alpha/gamma) can read them without a
+        # signature change. Set by training/validation/test steps. Shape
+        # [batch, max_seq_length], aligned 1:1 with `sequence` (pad positions=0).
+        self._batch_timestamps = None
 
         # If no external loss_fn, try to create from loss_type
         if self.loss_fn is None and hasattr(config, "loss_type"):
             from ..losses.factory import get_loss_function
 
-            loss_kwargs = getattr(config, "loss_kwargs", {})
+            loss_kwargs = dict(getattr(config, "loss_kwargs", {}))
+            # gBCE calibrates alpha = num_negatives / (vocab_size - 1) per the
+            # gSASRec paper. Thread the sampling rate through so it self-calibrates
+            # (unless the user pinned alpha explicitly in loss_kwargs). Only gBCE
+            # accepts these kwargs, so scope them to that loss.
+            if config.loss_type == "gbce" and "alpha" not in loss_kwargs:
+                loss_kwargs.setdefault("num_negatives", config.get("num_negatives"))
+                loss_kwargs.setdefault("vocab_size", self.vocab_size)
             self.loss_fn = get_loss_function(
                 config.loss_type, model_type="sequential", **loss_kwargs
             )
 
-        # Item embedding layer (vocab_size includes special tokens)
+        # Item embedding layer (vocab_size includes special tokens).
+        #
+        # Sparse tables (config.sparse_embeddings) are a single-GPU win for big
+        # catalogs, but only safe for sampled losses on a plain tied table --
+        # full-softmax / untied / LoRA paths produce dense grads SparseAdam
+        # can't consume. We resolve eligibility once here and fall back to a
+        # dense table (with a single warning) otherwise.
+        from ..utils.sparse_optim import sparse_embeddings_eligible
+
+        self._sparse_embeddings, _sparse_reason = sparse_embeddings_eligible(
+            config, type(self)
+        )
+        if getattr(config, "sparse_embeddings", False) and not self._sparse_embeddings:
+            import warnings
+
+            warnings.warn(
+                f"sparse_embeddings requested but disabled: {_sparse_reason}. "
+                "Falling back to a dense embedding table.",
+                stacklevel=2,
+            )
+
         embedding_config = config.get("embedding_config", {"type": "standard"})
         if embedding_config["type"] == "standard":
             self.item_embedding = nn.Embedding(
                 self.vocab_size,
                 self.embedding_dim,
                 padding_idx=0,
+                sparse=self._sparse_embeddings,
             )
+            # Default small-std init as a SAFETY NET. nn.Embedding defaults to
+            # N(0,1) (std=1.0) which is ~10-50x too large and hurts convergence
+            # -- subclasses that define _init_weights re-init afterward (their
+            # __init__ runs after this super().__init__), so this only affects
+            # models that would otherwise leave the table at the bad default
+            # (e.g. mamba4rec / llada4rec, which define no _init_weights).
+            nn.init.normal_(
+                self.item_embedding.weight, std=config.get("init_std", 0.02)
+            )
+            with torch.no_grad():
+                self.item_embedding.weight[0].zero_()  # keep PAD row at 0
         else:
             from ..modules.layer_utils.embedding_factory import create_embedding
+
             self.item_embedding = create_embedding(
                 embedding_type=embedding_config["type"],
                 num_embeddings=self.vocab_size,
                 embedding_dim=self.embedding_dim,
                 padding_idx=0,
-                **embedding_config.get("kwargs", {})
+                **embedding_config.get("kwargs", {}),
             )
 
     def _to_model_indices(self, targets: torch.Tensor) -> torch.Tensor:
@@ -156,11 +213,18 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
         return targets - 1
 
     def configure_optimizers(self):
-        """Configure optimizer for Lightning."""
+        """Configure optimizer for Lightning.
+
+        Uses a single AdamW for dense models. When the item table is sparse
+        (config.sparse_embeddings + sampled loss), builds SparseAdam (table) +
+        AdamW (dense) wrapped in HybridOptim so Lightning stays in automatic
+        optimization. Any configured scheduler wraps the returned optimizer and
+        decays both param groups.
+        """
+        from ..utils.sparse_optim import build_optimizer
+
         weight_decay = self.config.get("weight_decay", 1e-6)
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.lr, weight_decay=weight_decay
-        )
+        optimizer = build_optimizer(self, lr=self.lr, weight_decay=weight_decay)
 
         # Add learning rate scheduler if specified
         scheduler_config = self.config.get("scheduler")
@@ -204,7 +268,9 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
                 "lr_scheduler": {
                     "scheduler": scheduler,
                     "monitor": (
-                        scheduler_config.get("monitor", "val_loss") if scheduler_type == "reduce_on_plateau" else None
+                        scheduler_config.get("monitor", "val_loss")
+                        if scheduler_type == "reduce_on_plateau"
+                        else None
                     ),
                     "interval": "step" if warmup_steps > 0 else "epoch",
                 },
@@ -212,14 +278,48 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
 
         return optimizer
 
+    def configure_gradient_clipping(
+        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
+    ):
+        """Clip gradients, skipping sparse embedding tables.
+
+        Lightning's automatic clipping calls ``linalg_vector_norm`` which has no
+        sparse kernel, so when the item table is sparse we clip dense params
+        only. Dense models defer to Lightning's default behavior.
+        """
+        if not getattr(self, "_sparse_embeddings", False):
+            return super().configure_gradient_clipping(
+                optimizer, gradient_clip_val, gradient_clip_algorithm
+            )
+        if gradient_clip_val:
+            from ..utils.sparse_optim import clip_dense_grads_only
+
+            clip_dense_grads_only(
+                self, gradient_clip_val, gradient_clip_algorithm or "norm"
+            )
+
+    def set_eval_history(self, hist_ids):
+        """Register a per-user TRAIN-history table for validation masking.
+
+        hist_ids: LongTensor [num_users, Lmax] of 3-indexed item ids (pad 0).
+        Used only during validation metric computation (see validation_step) so
+        the monitored val NDCG masks already-seen items exactly like the test
+        full-sort eval. Must contain TRAIN items only -- never the val target --
+        or the target would be masked out of its own ranking. Mirrors
+        DeepModel.set_eval_history so the harness can wire both identically.
+        """
+        self._val_hist_ids = hist_ids
+
     def training_step(self, batch, batch_idx):
         """Training step for Lightning."""
+        self._batch_timestamps = batch.get("timestamps")
         loss = self.compute_loss(batch)
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         """Validation step for Lightning."""
+        self._batch_timestamps = batch.get("timestamps")
         # For LOO validation with explicit targets
         if "target" in batch and "negatives" not in batch:
             sequences = batch["sequence"]
@@ -229,30 +329,34 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
             # Compute loss only on target (last position)
             # Get logits for last position
             hidden_states = self.get_hidden_states(sequences, sequence_lengths)
-            logits = torch.matmul(hidden_states, self.get_output_embeddings().transpose(0, 1))
-            
+            logits = torch.matmul(
+                hidden_states, self.get_output_embeddings().transpose(0, 1)
+            )
+
             # Extract last position logits
             batch_indices = torch.arange(sequences.size(0), device=sequences.device)
-            last_indices = torch.clamp(sequence_lengths - 1, min=0, max=sequences.size(1) - 1)
+            last_indices = torch.clamp(
+                sequence_lengths - 1, min=0, max=sequences.size(1) - 1
+            )
             last_logits = logits[batch_indices, last_indices]
-            
+
             # Create single-position batch for loss function
             last_logits_expanded = last_logits.unsqueeze(1)  # [batch, 1, vocab]
             targets_expanded = targets.unsqueeze(1)  # [batch, 1]
             mask = torch.ones_like(targets_expanded, dtype=torch.bool)  # [batch, 1]
-            
+
             # Extract negatives for last position if present
             neg_items = batch.get("neg_items")
             if neg_items is not None and neg_items.dim() == 3:
                 # Per-position negatives: [batch, seq_len, num_neg] -> [batch, 1, num_neg]
                 neg_items = neg_items[batch_indices, last_indices].unsqueeze(1)
-            
+
             # Use model's loss function
             val_loss = self.loss_fn(
                 logits=last_logits_expanded,
                 targets=targets_expanded,
                 mask=mask,
-                neg_items=neg_items
+                neg_items=neg_items,
             )
             self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True)
 
@@ -260,21 +364,45 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
             if (self.current_epoch + 1) % self.metric_compute_interval == 0:
                 self._compute_metrics_this_epoch = True
                 predictions = self.predict_next(sequences, sequence_lengths)
-                predictions[:, :3] = float('-inf')  # Mask special tokens
-                
+                predictions[:, :3] = float("-inf")  # Mask special tokens
+                # Mask each user's already-seen TRAIN items, mirroring the TEST
+                # full-sort protocol (core.py) and DeepModel.validation_step.
+                # Without this the val NDCG that drives early stopping selects a
+                # different epoch than the reported (history-masked) test metric.
+                if self._val_hist_ids is not None and "user_id" in batch:
+                    hist = self._val_hist_ids.to(predictions.device)[batch["user_id"]]
+                    hist = hist.clamp_(max=predictions.size(1) - 1)
+                    predictions.scatter_(1, hist, float("-inf"))
+                    predictions[:, 0] = float("-inf")  # undo PAD-col unmask (pad=0)
+
                 if self._metric_calculator is None:
                     from rec_arena.metrics import MetricCalculator
-                    self._metric_calculator = MetricCalculator(k_values=self.val_k_values)
-                
+
+                    self._metric_calculator = MetricCalculator(
+                        k_values=self.val_k_values
+                    )
+
                 metrics = self._metric_calculator.calculate_all(
                     predictions.detach().cpu(), targets.detach().cpu()
                 )
                 for metric_name, value in metrics.items():
-                    self.log(f"val_{metric_name}", value, on_step=False, on_epoch=True, prog_bar=True)
+                    self.log(
+                        f"val_{metric_name}",
+                        value,
+                        on_step=False,
+                        on_epoch=True,
+                        prog_bar=True,
+                    )
             else:
                 # Reuse last computed NDCG for early stopping
-                self.log("val_ndcg@10", self._last_val_ndcg, on_step=False, on_epoch=True, prog_bar=True)
-            
+                self.log(
+                    "val_ndcg@10",
+                    self._last_val_ndcg,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=True,
+                )
+
             return val_loss
         else:
             loss = self.compute_loss(batch)
@@ -286,14 +414,17 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
         if self._compute_metrics_this_epoch:
             # Get the actual logged value (averaged across batches)
             if "val_ndcg@10" in self.trainer.callback_metrics:
-                self._last_val_ndcg = self.trainer.callback_metrics["val_ndcg@10"].item()
+                self._last_val_ndcg = self.trainer.callback_metrics[
+                    "val_ndcg@10"
+                ].item()
             self._compute_metrics_this_epoch = False
 
     def test_step(self, batch, batch_idx):
         """Test step for evaluation - computes and logs metrics.
-        
+
         Always returns predictions and targets for consistency with implicit models.
         """
+        self._batch_timestamps = batch.get("timestamps")
         if "target" in batch:
             # Test data with explicit targets (like validation)
             sequences = batch["sequence"]
@@ -305,7 +436,7 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
 
             # Mask special tokens (0, 1, 2) before computing metrics
             predictions_masked = predictions.clone()
-            predictions_masked[:, :3] = float('-inf')
+            predictions_masked[:, :3] = float("-inf")
 
             # Compute accuracy@10
             _, top10 = torch.topk(predictions_masked, k=10, dim=-1)
@@ -337,7 +468,7 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
             return {
                 "predictions": predictions_cpu,
                 "targets": targets_cpu,
-                "test_acc@10": acc10
+                "test_acc@10": acc10,
             }
         else:
             # Fallback for old-style test data
@@ -408,19 +539,37 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
                 neg_items = neg_items[:, 1:]  # Shift to [batch, seq_len-1]
             # else: assume global negatives per batch, no shifting needed
 
-        # Call loss function with hidden states for fast sampled logits
-        # Loss functions will use fast path if they support it, otherwise fall back to full logits
+        # Call loss function with hidden states for fast sampled logits.
+        # Loss functions use the fast path if they support it, else full logits.
+        # embedding_lookup is passed only for sparse tables (sampled losses,
+        # which accept it); dense models keep the original kwargs unchanged so
+        # full-softmax CrossEntropyLoss (no embedding_lookup arg) still works.
+        extra = {}
+        lookup = self.embedding_lookup()
+        if lookup is not None:
+            extra["embedding_lookup"] = lookup
         return self.loss_fn(
             hidden_states=shifted_hidden,
             item_embeddings=self.get_output_embeddings(),
             targets=shifted_targets,
             mask=shifted_mask,
             neg_items=neg_items,
+            **extra,
         )
 
     def set_loss_fn(self, loss_fn):
         """Set loss function for this model."""
         self.loss_fn = loss_fn
+
+    def get_batch_timestamps(self):
+        """Return current batch real timestamps [batch, seq_len] or None.
+
+        Time-aware subclasses (HSTU time bias, FuXi-alpha/gamma) call this to
+        obtain real interaction time for relative-time computations. Returns
+        None when timestamps are unavailable (e.g. data without a timestamp
+        column), letting models fall back to positional deltas.
+        """
+        return self._batch_timestamps
 
     def recommend_next(
         self, sequences: torch.Tensor, sequence_lengths: torch.Tensor, k: int = 10
@@ -439,11 +588,26 @@ class DeepSequentialModel(SequentialModel, pl.LightningModule):
 
     def get_output_embeddings(self) -> torch.Tensor:
         """Get output embedding weights for logit computation.
-        
+
         Override this in subclasses for untied embeddings or LoRA.
         Returns: [vocab_size, embedding_dim] tensor
         """
         return self.item_embedding.weight
+
+    def embedding_lookup(self):
+        """Return a sparse-safe item-lookup callable, or ``None``.
+
+        For sparse tables, returns ``self.item_embedding`` (a module forward)
+        so sampled-loss gradients on the looked-up rows stay sparse and
+        SparseAdam-consumable. Dense models return ``None`` so losses keep their
+        default ``weight[ids]`` index path (identical numerics, no overhead).
+
+        Valid only because sparse eligibility guarantees tied input/output
+        tables, so the looked-up table equals ``get_output_embeddings()``.
+        """
+        if not getattr(self, "_sparse_embeddings", False):
+            return None
+        return self.item_embedding
 
     def get_sequence_embedding(
         self, sequences: torch.Tensor, sequence_lengths: torch.Tensor

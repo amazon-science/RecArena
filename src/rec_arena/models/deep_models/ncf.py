@@ -37,18 +37,26 @@ class NCF(DeepModel):
 
         # GMF (Generalized Matrix Factorization) embeddings
         self.user_embedding_mf = nn.Embedding(
-            self.config.num_users, self.config.embedding_dim
+            self.config.num_users,
+            self.config.embedding_dim,
+            sparse=self._sparse_embeddings,
         )
         self.item_embedding_mf = nn.Embedding(
-            self.config.num_items, self.config.embedding_dim
+            self.config.num_items,
+            self.config.embedding_dim,
+            sparse=self._sparse_embeddings,
         )
 
         # MLP embeddings
         self.user_embedding_mlp = nn.Embedding(
-            self.config.num_users, self.config.hidden_dims[0] // 2
+            self.config.num_users,
+            self.config.hidden_dims[0] // 2,
+            sparse=self._sparse_embeddings,
         )
         self.item_embedding_mlp = nn.Embedding(
-            self.config.num_items, self.config.hidden_dims[0] // 2
+            self.config.num_items,
+            self.config.hidden_dims[0] // 2,
+            sparse=self._sparse_embeddings,
         )
 
         # MLP layers

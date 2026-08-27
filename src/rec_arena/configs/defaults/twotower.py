@@ -17,7 +17,7 @@ class TwoTowerConfig(BaseModelConfig):
 
     # Training
     lr: float = 1e-3
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-6  # homogeneous neural-baseline weight decay
 
     # Validation metrics
     compute_val_metrics: bool = False
@@ -34,7 +34,7 @@ class TwoTowerConfig(BaseModelConfig):
     # Model parameters
     num_users: Optional[int] = None
     num_items: Optional[int] = None
-    
+
     # Embedding configuration
     user_embedding_config: dict = None
     item_embedding_config: dict = None
@@ -49,10 +49,10 @@ class TwoTowerConfig(BaseModelConfig):
 
         if not 0 <= self.dropout_rate <= 1:
             raise ValueError("dropout_rate must be between 0 and 1")
-        
+
         # Set default embedding configs
         if self.user_embedding_config is None:
             self.user_embedding_config = {"type": "standard"}
-        
+
         if self.item_embedding_config is None:
             self.item_embedding_config = {"type": "standard"}

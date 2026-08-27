@@ -157,11 +157,14 @@ class TestSimpleX:
         scores = model.forward(users, items)
         assert scores.shape == (BATCH,)
 
-    def test_predict_returns_probabilities(self, model):
+    def test_predict_returns_cosine(self, model):
+        # Faithful SimpleX predict returns cosine similarity in [-1, 1] (NOT a
+        # sigmoid probability -- the old sigmoid was part of the incorrect
+        # cosine-MF-with-BPR implementation).
         users = torch.randint(0, NUM_USERS, (BATCH,))
         items = torch.randint(0, NUM_ITEMS, (BATCH,))
-        probs = model.predict(users, items)
-        assert (probs >= 0).all() and (probs <= 1).all()
+        scores = model.predict(users, items)
+        assert (scores >= -1.001).all() and (scores <= 1.001).all()
 
     def test_recommend_shapes(self, model):
         users = torch.tensor([0, 1])
@@ -172,7 +175,7 @@ class TestSimpleX:
         users = torch.randint(0, NUM_USERS, (BATCH,))
         items = torch.randint(0, NUM_ITEMS, (BATCH,))
         scores = model.forward(users, items)
-        assert (scores >= -1).all() and (scores <= 1).all()
+        assert (scores >= -1.001).all() and (scores <= 1.001).all()
 
     def test_gradient_flows(self, model):
         users = torch.randint(0, NUM_USERS, (BATCH,))
@@ -181,11 +184,23 @@ class TestSimpleX:
         scores.sum().backward()
         assert model.user_embedding.weight.grad is not None
 
-    def test_get_hidden_states(self, model):
-        users = torch.randint(0, NUM_USERS, (BATCH,))
-        items = torch.randint(0, NUM_ITEMS, (BATCH,))
-        hs = model.get_hidden_states(users, items)
-        assert hs.shape == (BATCH, EMB_DIM * 2)
+    def test_ccl_loss_runs(self, model):
+        # Faithful SimpleX uses its own Cosine-Contrastive Loss in compute_loss.
+        batch = {
+            "user_id": torch.randint(0, NUM_USERS, (BATCH,)),
+            "item_id": torch.randint(1, NUM_ITEMS, (BATCH,)),
+            "neg_items": torch.randint(1, NUM_ITEMS, (BATCH, 5)),
+        }
+        loss = model.compute_loss(batch)
+        assert loss.dim() == 0 and torch.isfinite(loss) and loss.item() >= 0
+
+    def test_history_aggregation(self, model):
+        # With user history set, gamma<1 mixes in the UI_map(history) term.
+        hist_id = torch.randint(0, NUM_ITEMS, (NUM_USERS, 5))
+        hist_len = torch.randint(1, 6, (NUM_USERS,)).float()
+        model.set_user_history(hist_id, hist_len)
+        scores = model.full_sort_scores(torch.arange(NUM_USERS))
+        assert scores.shape == (NUM_USERS, NUM_ITEMS)
 
 
 class TestSimpleXCoverage:

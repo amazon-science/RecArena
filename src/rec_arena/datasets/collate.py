@@ -8,6 +8,54 @@ from typing import List, Dict, Set
 DEFAULT_ITEM_OFFSET = 3
 
 
+def _sample_negatives_fast(
+    rng: np.random.Generator,
+    lo: int,
+    hi: int,
+    positives,
+    n: int,
+) -> np.ndarray:
+    """Draw ``n`` negative item ids in ``[lo, hi)`` excluding ``positives``.
+
+    Rejection sampling: oversample uniformly from the full range and drop the
+    (rare, thanks to sparsity) collisions with the user's positives. This is
+    O(n + |positives|) per call vs the old np.setdiff1d(all_items, positives)
+    which allocated + sorted a full catalog-sized array O(num_items log num_items)
+    for EVERY batch row -- the dominant cost for MF / sampled-loss models
+    (BPR-MF, NCF, SimpleX). Negatives may repeat (uniform-with-replacement,
+    matching RecBole); the only invariant preserved is "no positive is a
+    negative". Falls back to plain uniform when the user has no history.
+    """
+    if not positives:
+        return rng.integers(lo, hi, size=n, dtype=np.int64)
+
+    # Ensure a real set for O(1) membership (histories are already sets, but a
+    # caller might pass a list). Rejection via Python `in` on a set is ~8x
+    # faster here than np.isin, which is O(n * |positives|) and was the actual
+    # hot spot (measured 27us vs 3us per draw at catalog size ~14k).
+    pos = positives if isinstance(positives, (set, frozenset)) else set(positives)
+    out = np.empty(n, dtype=np.int64)
+    filled = 0
+    # Oversample uniformly, then reject collisions. Collision prob per draw =
+    # |positives| / (hi-lo) is tiny for sparse data, so 1-2 rounds suffice.
+    for _ in range(32):
+        need = n - filled
+        if need <= 0:
+            break
+        cand = rng.integers(lo, hi, size=need + 8, dtype=np.int64)
+        for x in cand.tolist():
+            if x not in pos:
+                out[filled] = x
+                filled += 1
+                if filled == n:
+                    break
+    if filled < n:
+        # Degenerate case (catalog almost entirely positives): top up with plain
+        # uniform draws so the shape is always satisfied.
+        out[filled:] = rng.integers(lo, hi, size=n - filled, dtype=np.int64)
+    return out
+
+
 class SequentialNegativeSamplingCollate:
     """Collate function with dynamic per-batch negative sampling for sequential models."""
 
@@ -37,31 +85,32 @@ class SequentialNegativeSamplingCollate:
         user_ids = torch.stack([item["user_id"] for item in batch])
 
         batch_size, seq_len = sequences.shape
-        neg_items = torch.zeros(batch_size, seq_len, self.num_negatives, dtype=torch.long)
+        neg_items = torch.zeros(
+            batch_size, seq_len, self.num_negatives, dtype=torch.long
+        )
 
         if self.sampler is not None:
             for i, user_id in enumerate(user_ids.tolist()):
                 user_positives = self.user_histories.get(user_id, set())
                 total_samples = seq_len * self.num_negatives
                 sampled_flat = self.sampler.sample(user_positives, total_samples)
-                neg_items[i] = torch.from_numpy(sampled_flat.reshape(seq_len, self.num_negatives))
+                neg_items[i] = torch.from_numpy(
+                    sampled_flat.reshape(seq_len, self.num_negatives)
+                )
         else:
-            # Lazy per-batch candidate computation (faster than pre-computing all users)
+            # Fast rejection sampling per user (see _sample_negatives_fast):
+            # draw all seq_len*num_neg negatives in one call, no per-row
+            # catalog-sized setdiff1d.
+            lo, hi = self.item_offset, self.num_items + self.item_offset
+            total_samples = seq_len * self.num_negatives
             for i, user_id in enumerate(user_ids.tolist()):
                 user_positives = self.user_histories.get(user_id, set())
-                # Fast set difference using numpy
-                candidates = np.setdiff1d(self.all_items, list(user_positives), assume_unique=True)
-                
-                if len(candidates) >= self.num_negatives:
-                    # Sample all positions at once
-                    total_samples = seq_len * self.num_negatives
-                    sampled_flat = self.rng.choice(candidates, size=total_samples, replace=True)
-                    neg_items[i] = torch.from_numpy(sampled_flat.reshape(seq_len, self.num_negatives))
-                elif len(candidates) > 0:
-                    # Fallback for users with few candidates
-                    for pos in range(seq_len):
-                        sampled = self.rng.choice(candidates, size=min(self.num_negatives, len(candidates)), replace=False)
-                        neg_items[i, pos, :len(sampled)] = torch.from_numpy(sampled)
+                sampled_flat = _sample_negatives_fast(
+                    self.rng, lo, hi, user_positives, total_samples
+                )
+                neg_items[i] = torch.from_numpy(
+                    sampled_flat.reshape(seq_len, self.num_negatives)
+                )
 
         result = {
             "sequence": sequences,
@@ -72,6 +121,11 @@ class SequentialNegativeSamplingCollate:
 
         if "target" in batch[0]:
             result["target"] = torch.stack([item["target"] for item in batch])
+
+        # Preserve real interaction timestamps for time-aware models
+        # (HSTU time bias, FuXi-alpha, FuXi-gamma). Aligned 1:1 with `sequence`.
+        if "timestamps" in batch[0]:
+            result["timestamps"] = torch.stack([item["timestamps"] for item in batch])
 
         return result
 
@@ -106,21 +160,23 @@ class ImplicitNegativeSamplingCollate:
         batch_size = len(batch)
         neg_items = torch.zeros(batch_size, self.num_negatives, dtype=torch.long)
 
+        lo, hi = self.item_offset, self.num_items + self.item_offset
         for i, user_id in enumerate(user_ids.tolist()):
             user_positives = self.user_histories.get(user_id, set())  # 3-indexed
 
             if self.sampler is not None:
-                sampled = self.sampler.sample(user_positives, user_id)
+                # sampler.sample(user_positives, n): 2nd arg is the sample COUNT,
+                # not the user id (that bug silently sampled `user_id` negatives).
+                sampled = self.sampler.sample(user_positives, self.num_negatives)
                 neg_items[i, : len(sampled)] = torch.tensor(sampled, dtype=torch.long)
             else:
-                # Sample from correct range [item_offset, num_items + item_offset - 1]
-                candidates = np.setdiff1d(self.all_items, list(user_positives), assume_unique=True)
-                sampled = self.rng.choice(
-                    candidates,
-                    size=min(self.num_negatives, len(candidates)),
-                    replace=False,
+                # Fast rejection sampling (see _sample_negatives_fast): avoids the
+                # old per-row np.setdiff1d over the full catalog, which dominated
+                # runtime for MF / sampled-loss models.
+                sampled = _sample_negatives_fast(
+                    self.rng, lo, hi, user_positives, self.num_negatives
                 )
-                neg_items[i, : len(sampled)] = torch.from_numpy(sampled)
+                neg_items[i] = torch.from_numpy(sampled)
 
         return {"user_id": user_ids, "item_id": item_ids, "neg_items": neg_items}
 
@@ -143,7 +199,9 @@ class BatchSharedNegativeSamplingCollate:
         item_offset: int = DEFAULT_ITEM_OFFSET,
     ):
         self.num_items = num_items
-        self.num_negatives = sampler.num_negatives if sampler is not None else num_negatives
+        self.num_negatives = (
+            sampler.num_negatives if sampler is not None else num_negatives
+        )
         self.user_histories = user_histories or {}
         self.sampler = sampler
         self.item_offset = item_offset
@@ -158,13 +216,15 @@ class BatchSharedNegativeSamplingCollate:
         batch_size = len(batch)
         neg_items = torch.zeros(batch_size, self.num_negatives, dtype=torch.long)
 
+        lo, hi = self.item_offset, self.num_items + self.item_offset
         for i, user_id in enumerate(user_ids.tolist()):
             user_positives = self.user_histories.get(user_id, set())
             if self.sampler is not None:
                 sampled = self.sampler.sample(user_positives, self.num_negatives)
             else:
-                candidates = np.setdiff1d(self.all_items, list(user_positives), assume_unique=True)
-                sampled = self.rng.choice(candidates, size=self.num_negatives, replace=len(candidates) < self.num_negatives)
+                sampled = _sample_negatives_fast(
+                    self.rng, lo, hi, user_positives, self.num_negatives
+                )
             neg_items[i] = torch.from_numpy(sampled)
 
         result = {
@@ -175,6 +235,8 @@ class BatchSharedNegativeSamplingCollate:
         }
         if "target" in batch[0]:
             result["target"] = torch.stack([item["target"] for item in batch])
+        if "timestamps" in batch[0]:
+            result["timestamps"] = torch.stack([item["timestamps"] for item in batch])
         return result
 
 
@@ -210,21 +272,19 @@ class GraphNegativeSamplingCollate:
         batch_size = len(batch)
         neg_items = torch.zeros(batch_size, self.num_negatives, dtype=torch.long)
 
+        lo, hi = self.item_offset, self.num_items + self.item_offset
         for i, user_id in enumerate(user_ids.tolist()):
             user_positives = self.user_histories.get(user_id, set())
 
             if self.sampler is not None:
-                sampled = self.sampler.sample(user_positives, user_id)
+                # 2nd arg to sampler.sample is the sample COUNT, not the user id.
+                sampled = self.sampler.sample(user_positives, self.num_negatives)
                 neg_items[i, : len(sampled)] = torch.tensor(sampled, dtype=torch.long)
             else:
-                # Sample from correct range [item_offset, num_items + item_offset - 1]
-                candidates = np.setdiff1d(self.all_items, list(user_positives), assume_unique=True)
-                sampled = self.rng.choice(
-                    candidates,
-                    size=min(self.num_negatives, len(candidates)),
-                    replace=False,
+                sampled = _sample_negatives_fast(
+                    self.rng, lo, hi, user_positives, self.num_negatives
                 )
-                neg_items[i, : len(sampled)] = torch.from_numpy(sampled)
+                neg_items[i] = torch.from_numpy(sampled)
 
         return {
             "user_id": user_ids,

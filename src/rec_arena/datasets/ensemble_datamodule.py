@@ -165,14 +165,16 @@ class EnsembleRecDataModule(RecDataModule):
                 train_df=train_df,
             )
 
-            # For test: use train+val combined
-            train_val_df = pd.concat([train_df, val_df])
+            # Test input = pure train history + VAL item appended at the end
+            # (LOO semantics; append is order-preserving, avoids the
+            # timestamp-tie reordering bug -- see prepare_sequences docstring).
             test_data = prepare_sequences(
                 test_df,
                 self.max_seq_length,
                 self.model_type,
                 for_val_loo=True,
-                train_df=train_val_df,
+                train_df=train_df,
+                append_df=val_df,
             )
 
             # Use standard SequentialDataset (no ensemble-specific dataset needed)

@@ -21,7 +21,7 @@ class CrossEntropyLoss(nn.Module):
         )
 
     def __call__(self, logits=None, targets=None, mask=None, neg_items=None,
-                 hidden_states=None, item_embeddings=None):
+                 hidden_states=None, item_embeddings=None, output_bias=None):
         """Compute cross-entropy loss.
 
         Args:
@@ -31,6 +31,11 @@ class CrossEntropyLoss(nn.Module):
             neg_items: Not used (API consistency)
             hidden_states: [batch, seq_len, dim] (optional)
             item_embeddings: [vocab_size, dim] (optional)
+            output_bias: [vocab_size] optional per-item additive logit bias
+                (popularity prior). When provided and logits are computed from
+                hidden_states here, it is added to every logit so the bias is
+                TRAINED, matching how it is applied at inference (BERT4Rec /
+                RecBole). Default None = no bias (unchanged behavior).
 
         Returns:
             Scalar loss value
@@ -39,6 +44,8 @@ class CrossEntropyLoss(nn.Module):
         if logits is None:
             if hidden_states is not None and item_embeddings is not None:
                 logits = torch.matmul(hidden_states, item_embeddings.transpose(0, 1))
+                if output_bias is not None:
+                    logits = logits + output_bias
             else:
                 raise ValueError(
                     "Must provide either logits or (hidden_states + item_embeddings)"

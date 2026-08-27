@@ -456,6 +456,47 @@ class TestHSTUComputeLoss:
 
 
 # ===================================================================
+# Mamba4Rec
+# ===================================================================
+
+
+try:
+    from rec_arena.configs.defaults.mamba4rec import Mamba4RecConfig
+    from rec_arena.models.sequential_models.mamba4rec import Mamba4Rec
+    # Try to actually instantiate to check if mamba2 is available
+    _test_cfg = Mamba4RecConfig(vocab_size=10, embedding_dim=8, d_model=8, d_state=4,
+                                 d_conv=2, expand_factor=2, num_layers=1, max_seq_length=4)
+    Mamba4Rec(_test_cfg)
+    _HAS_MAMBA = True
+    del _test_cfg
+except (ImportError, Exception):
+    _HAS_MAMBA = False
+
+
+@pytest.mark.skipif(not _HAS_MAMBA, reason="Mamba4Rec requires mamba2 library")
+class TestMamba4Rec:
+    @pytest.fixture
+    def model(self):
+        config = Mamba4RecConfig(
+            vocab_size=VOCAB, embedding_dim=EMB_DIM, d_model=EMB_DIM,
+            d_state=8, d_conv=4, expand_factor=2, num_layers=1,
+            dropout_rate=0.0, max_seq_length=SEQ_LEN,
+            loss_type="cross_entropy",
+        )
+        return Mamba4Rec(config)
+
+    def test_forward_output_shape(self, model):
+        seqs = torch.randint(3, VOCAB, (BATCH, SEQ_LEN))
+        lengths = torch.full((BATCH,), SEQ_LEN, dtype=torch.long)
+        logits = model.forward(seqs, lengths)
+        assert logits.shape == (BATCH, SEQ_LEN, VOCAB)
+
+    def test_predict_next_shape(self, model):
+        seqs = torch.randint(3, VOCAB, (BATCH, SEQ_LEN))
+        lengths = torch.full((BATCH,), SEQ_LEN, dtype=torch.long)
+        probs = model.predict_next(seqs, lengths)
+        assert probs.shape == (BATCH, VOCAB)
+
     def test_get_hidden_states_shape(self, model):
         seqs = torch.randint(3, VOCAB, (BATCH, SEQ_LEN))
         lengths = torch.full((BATCH,), SEQ_LEN, dtype=torch.long)

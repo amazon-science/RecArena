@@ -60,7 +60,9 @@ class ConfigValidator:
                 raise ValueError(f"{field} must be a positive integer, got {value}")
 
         if "loss_type" in config:
-            valid_losses = ["bce", "bpr"]
+            # "ccl" = SimpleX's Cosine-Contrastive Loss (implemented inside the
+            # model's compute_loss, not the generic loss factory).
+            valid_losses = ["bce", "bpr", "ccl"]
             if config["loss_type"] not in valid_losses:
                 raise ValueError(
                     f"Invalid loss_type for implicit model: {config['loss_type']}"

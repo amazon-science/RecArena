@@ -16,8 +16,16 @@ class BPRLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def __call__(self, logits=None, targets=None, mask=None, neg_items=None,
-                 hidden_states=None, item_embeddings=None):
+    def __call__(
+        self,
+        logits=None,
+        targets=None,
+        mask=None,
+        neg_items=None,
+        hidden_states=None,
+        item_embeddings=None,
+        embedding_lookup=None,
+    ):
         """Compute BPR loss with negative sampling.
 
         Args:
@@ -27,6 +35,7 @@ class BPRLoss(nn.Module):
             neg_items: [batch, seq_len, num_neg] or [batch, num_neg] (required)
             hidden_states: [batch, seq_len, dim] (optional, for fast path)
             item_embeddings: [vocab_size, dim] (optional, for fast path)
+            embedding_lookup: optional ids->emb callable for sparse-safe lookup.
 
         Returns:
             Scalar loss value
@@ -36,43 +45,61 @@ class BPRLoss(nn.Module):
                 "BPR loss requires negative samples in neg_items parameter"
             )
 
-        batch_size, seq_len = targets.shape if targets.dim() == 2 else (targets.shape[0], 1)
+        batch_size, seq_len = (
+            targets.shape if targets.dim() == 2 else (targets.shape[0], 1)
+        )
 
         # Fast path: compute sampled logits directly from hidden states
         if hidden_states is not None and item_embeddings is not None:
+            lookup = (
+                embedding_lookup
+                if embedding_lookup is not None
+                else (lambda ids: item_embeddings[ids])
+            )
             # Gather embeddings for positive and negative items
-            pos_emb = item_embeddings[targets]  # [batch, seq_len, dim]
-            
+            pos_emb = lookup(targets)  # [batch, seq_len, dim]
+
             # Compute positive scores
             pos_scores = (hidden_states * pos_emb).sum(dim=-1)  # [batch, seq_len]
-            
+
             # Handle negative items (2D or 3D)
+            neg_emb = lookup(neg_items)
             if neg_items.dim() == 3:
-                # Per-position negatives: [batch, seq_len, num_neg]
-                neg_emb = item_embeddings[neg_items]  # [batch, seq_len, num_neg, dim]
-                neg_scores = torch.einsum('bsd,bsnd->bsn', hidden_states, neg_emb)  # [batch, seq_len, num_neg]
+                # Per-position negatives: [batch, seq_len, num_neg, dim]
+                neg_scores = torch.einsum(
+                    "bsd,bsnd->bsn", hidden_states, neg_emb
+                )  # [batch, seq_len, num_neg]
             elif neg_items.dim() == 2:
-                # Global negatives: [batch, num_neg]
-                neg_emb = item_embeddings[neg_items]  # [batch, num_neg, dim]
-                neg_scores = torch.einsum('bsd,bnd->bsn', hidden_states, neg_emb)  # [batch, seq_len, num_neg]
+                # Global negatives: [batch, num_neg, dim]
+                neg_scores = torch.einsum(
+                    "bsd,bnd->bsn", hidden_states, neg_emb
+                )  # [batch, seq_len, num_neg]
             else:
                 raise ValueError(f"Unexpected neg_items shape: {neg_items.shape}")
-        
+
         # Slow path: use pre-computed logits (backward compatible)
         elif logits is not None:
             vocab_size = logits.shape[-1]
-            
+
             # Gather positive scores: logits[b, t, targets[b, t]]
-            pos_scores = torch.gather(logits, dim=2, index=targets.unsqueeze(-1)).squeeze(-1)  # [batch, seq_len]
+            pos_scores = torch.gather(
+                logits, dim=2, index=targets.unsqueeze(-1)
+            ).squeeze(
+                -1
+            )  # [batch, seq_len]
 
             # Extract negative scores from logits
             if neg_items.dim() == 3:
                 # Per-position negatives: [batch, seq_len, num_neg]
-                neg_scores = torch.gather(logits, dim=2, index=neg_items)  # [batch, seq_len, num_neg]
+                neg_scores = torch.gather(
+                    logits, dim=2, index=neg_items
+                )  # [batch, seq_len, num_neg]
             elif neg_items.dim() == 2:
                 # Global negatives per batch: [batch, num_neg]
                 neg_items_expanded = neg_items.unsqueeze(1).expand(-1, seq_len, -1)
-                neg_scores = torch.gather(logits, dim=2, index=neg_items_expanded)  # [batch, seq_len, num_neg]
+                neg_scores = torch.gather(
+                    logits, dim=2, index=neg_items_expanded
+                )  # [batch, seq_len, num_neg]
             else:
                 raise ValueError(f"Unexpected neg_items shape: {neg_items.shape}")
         else:

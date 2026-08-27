@@ -8,13 +8,16 @@ from ...configs.defaults.recm import RecMConfig
 
 class RecM(DeepSequentialModel):
 
+    # Ensemble compute_loss forms full-vocab logits (dense table gradient).
+    SUPPORTS_SPARSE = False
+
     def __init__(self, config: RecMConfig):
         super().__init__(config)
 
         self.save_hyperparameters()
 
         # Learnable position embedding
-        position_config = getattr(self.config, 'position_config', {"type": "learnable"})
+        position_config = getattr(self.config, "position_config", {"type": "learnable"})
         if position_config["type"] == "rope":
             self.pos_embedding = None
         else:
@@ -75,11 +78,17 @@ class RecM(DeepSequentialModel):
             ),
         )
 
-        # Output embeddings (same as GSASRec)
+        # Output embeddings (untied scoring table). When reuse_item_embeddings
+        # is False, score against a SEPARATE table instead of the tied input
+        # item_embedding. The table must have the SAME row count as the input
+        # table (self.vocab_size, which already includes the special tokens) so
+        # logits align with target item indices. self.num_items was never set on
+        # this model (the base tracks self.vocab_size), so the previous
+        # `self.num_items + 2` reference would crash the moment this branch ran.
         self.reuse_item_embeddings = self.config.reuse_item_embeddings
         if not self.reuse_item_embeddings:
             self.output_embedding = torch.nn.Embedding(
-                self.num_items + 2, self.embedding_dim
+                self.vocab_size, self.embedding_dim, padding_idx=0
             )
 
         # Pre-create loss functions for each ensemble member (avoid recreation overhead)
@@ -110,6 +119,17 @@ class RecM(DeepSequentialModel):
 
         self._init_weights()
 
+    def get_output_embeddings(self) -> torch.Tensor:
+        """Output scoring table.
+
+        Returns the untied output_embedding table when reuse_item_embeddings is
+        False, otherwise the tied input item_embedding (base behavior). The
+        default (reuse=True) path is unchanged.
+        """
+        if not self.reuse_item_embeddings:
+            return self.output_embedding.weight
+        return self.item_embedding.weight
+
     def forward(self, sequences, sequence_lengths):
         """Forward pass through RecM - returns logits for ALL positions and ensembles.
 
@@ -121,8 +141,10 @@ class RecM(DeepSequentialModel):
 
         # Compute logits for all positions, ensembles and items using einsum
         # WARNING: This can be memory-intensive for large vocab!
+        # Use get_output_embeddings() so the untied table is respected (identity
+        # for the default reuse_item_embeddings=True path).
         logits = torch.einsum(
-            "nskd,vd->nskv", hidden_states, self.item_embedding.weight
+            "nskd,vd->nskv", hidden_states, self.get_output_embeddings()
         )
 
         return logits  # (N, S, K, V)
@@ -131,17 +153,17 @@ class RecM(DeepSequentialModel):
         """Predict next item probabilities for the last position - OPTIMIZED."""
         # Get hidden states for all positions (N, S, K, D)
         hidden_states = self.get_hidden_states(sequences, sequence_lengths)
-        
+
         # Extract ONLY last valid position (much more efficient!)
         batch_indices = torch.arange(sequences.size(0), device=sequences.device)
         last_indices = torch.clamp(
             sequence_lengths - 1, min=0, max=sequences.size(1) - 1
         )
         last_hidden = hidden_states[batch_indices, last_indices]  # (N, K, D)
-        
+
         # Compute logits only for last position
         last_logits = torch.einsum(
-            "nkd,vd->nkv", last_hidden, self.item_embedding.weight
+            "nkd,vd->nkv", last_hidden, self.get_output_embeddings()
         )  # (N, K, V)
 
         # Ensemble prediction: softmax per member, then average
@@ -194,7 +216,7 @@ class RecM(DeepSequentialModel):
 
         # Apply batch ensemble projection with residual connection
         ensemble_embeds = self.sequence_projection(x)  # (N, S, K, D)
-        
+
         # Add residual: broadcast x from (N, S, D) to (N, S, K, D)
         ensemble_embeds = ensemble_embeds + x.unsqueeze(2)
 
@@ -300,7 +322,9 @@ class RecM(DeepSequentialModel):
                 if ensemble_neg_items is not None:
                     if ensemble_neg_items.dim() == 3:
                         ensemble_neg_items = ensemble_neg_items[:, 1:, :]
-                    elif ensemble_neg_items.dim() == 2 and ensemble_neg_items.size(1) > 1:
+                    elif (
+                        ensemble_neg_items.dim() == 2 and ensemble_neg_items.size(1) > 1
+                    ):
                         if ensemble_neg_items.size(1) == targets.size(1):
                             ensemble_neg_items = ensemble_neg_items[:, 1:]
 
@@ -320,7 +344,7 @@ class RecM(DeepSequentialModel):
                 # Other losses use hidden_states + item_embeddings directly
                 if loss_type == "cross_entropy":
                     ensemble_k_logits = torch.matmul(
-                        ensemble_k_states, self.item_embedding.weight.transpose(0, 1)
+                        ensemble_k_states, self.get_output_embeddings().transpose(0, 1)
                     )
                     loss_k = ensemble_loss_fn(
                         logits=ensemble_k_logits,
@@ -332,7 +356,7 @@ class RecM(DeepSequentialModel):
                     # Pass hidden_states for memory-efficient computation
                     loss_k = ensemble_loss_fn(
                         hidden_states=ensemble_k_states,
-                        item_embeddings=self.item_embedding.weight,
+                        item_embeddings=self.get_output_embeddings(),
                         targets=shifted_targets,
                         mask=shifted_mask,
                         neg_items=ensemble_neg_items,
@@ -351,11 +375,15 @@ class RecM(DeepSequentialModel):
                     if loss_type not in loss_type_magnitudes:
                         loss_type_magnitudes[loss_type] = mag
                     else:
-                        loss_type_magnitudes[loss_type] = loss_type_magnitudes[loss_type] + mag
+                        loss_type_magnitudes[loss_type] = (
+                            loss_type_magnitudes[loss_type] + mag
+                        )
 
                 # Target: normalize all losses to have similar magnitude
                 if loss_type_magnitudes:
-                    target_magnitude = sum(loss_type_magnitudes.values()) / len(loss_type_magnitudes)
+                    target_magnitude = sum(loss_type_magnitudes.values()) / len(
+                        loss_type_magnitudes
+                    )
                 else:
                     target_magnitude = 1.0  # Fallback if all losses are NaN
 
@@ -379,7 +407,7 @@ class RecM(DeepSequentialModel):
 
                 # Compute logits (memory-efficient!)
                 ensemble_k_logits = torch.matmul(
-                    ensemble_k_states, self.item_embedding.weight.transpose(0, 1)
+                    ensemble_k_states, self.get_output_embeddings().transpose(0, 1)
                 )
 
                 # Get negatives if present
@@ -465,7 +493,7 @@ class RecM(DeepSequentialModel):
             return {
                 "predictions": predictions_cpu,
                 "targets": targets_cpu,
-                "test_acc@10": acc10
+                "test_acc@10": acc10,
             }
         else:
             # Fallback to base implementation
@@ -478,9 +506,16 @@ class RecM(DeepSequentialModel):
         # Zero out padding embedding
         with torch.no_grad():
             self.item_embedding.weight[0].zero_()
-        
+
         if self.pos_embedding is not None:
             nn.init.normal_(self.pos_embedding.weight, std=0.02)
+
+        # Untied output scoring table (only present when reuse_item_embeddings
+        # is False) gets the same small-std init + zeroed PAD row.
+        if not self.reuse_item_embeddings:
+            nn.init.normal_(self.output_embedding.weight, std=0.02)
+            with torch.no_grad():
+                self.output_embedding.weight[0].zero_()
 
         # Note: LinearBatchEnsembleLayer handles its own initialization in reset_parameters()
         # We only need to initialize standard nn.Linear layers here

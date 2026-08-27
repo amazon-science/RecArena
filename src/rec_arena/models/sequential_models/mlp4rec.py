@@ -33,26 +33,39 @@ class MLP4Rec(DeepSequentialModel):
         >>> logits = model.forward(sequences, sequence_lengths)
     """
 
+    # Ensemble compute_loss forms full-vocab logits (dense table gradient).
+    SUPPORTS_SPARSE = False
+
     def __init__(self, config: MLP4RecConfig):
         super().__init__(config)
         self.save_hyperparameters()
-        
+
         self.ensemble_size = self.config.ensemble_size
         self.is_ensemble = self.ensemble_size > 1
 
         # Position embeddings
-        self.pos_embedding = nn.Embedding(self.config.max_seq_length, self.embedding_dim)
-        
+        self.pos_embedding = nn.Embedding(
+            self.config.max_seq_length, self.embedding_dim
+        )
+
         # Ensemble embedding adapters (if ensemble mode)
         if self.is_ensemble:
-            self.embedding_r = nn.Parameter(torch.ones(self.ensemble_size, self.embedding_dim))
-            self.embedding_s = nn.Parameter(torch.ones(self.ensemble_size, self.embedding_dim))
+            self.embedding_r = nn.Parameter(
+                torch.ones(self.ensemble_size, self.embedding_dim)
+            )
+            self.embedding_s = nn.Parameter(
+                torch.ones(self.ensemble_size, self.embedding_dim)
+            )
 
         # Learnable recency weights for mean pooling
         self.recency_weights = nn.Parameter(torch.zeros(self.config.max_seq_length))
 
         # Pre-MLP layer norm (adjust for multi-scale pooling: 2x for last+mean)
-        mlp_input_dim = self.embedding_dim * 2 if self.config.pooling == "multi" else self.embedding_dim
+        mlp_input_dim = (
+            self.embedding_dim * 2
+            if self.config.pooling == "multi"
+            else self.embedding_dim
+        )
         self.pre_mlp_norm = nn.LayerNorm(mlp_input_dim)
 
         # Build MLP layers (skip if empty for EmbeddingOnly)
@@ -106,7 +119,7 @@ class MLP4Rec(DeepSequentialModel):
             else:
                 self.output_projection = nn.Linear(prev_dim, self.embedding_dim)
             self.final_layer_norm = nn.LayerNorm(self.embedding_dim)
-        
+
         # Store the actual embedding dim for predictions
         self.output_dim = self.embedding_dim
 
@@ -137,7 +150,9 @@ class MLP4Rec(DeepSequentialModel):
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 # Kaiming initialization for better gradient flow
-                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(
+                    module.weight, mode="fan_out", nonlinearity="relu"
+                )
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.LayerNorm):
@@ -146,23 +161,24 @@ class MLP4Rec(DeepSequentialModel):
 
     def forward(self, sequences, sequence_lengths):
         """Forward pass - returns logits for ALL positions.
-        
+
         Returns:
             Non-ensemble: [B, S, V]
             Ensemble: [B, S, E, V]
         """
         hidden_states = self.get_hidden_states(sequences, sequence_lengths)
-        
+
+        output_weight = self.get_output_embeddings()  # [V, D]
         if self.is_ensemble:
             # hidden_states: [B, S, E, D], compute logits per ensemble member
-            logits = torch.einsum('bsed,vd->bsev', hidden_states, self.item_embedding.weight)
+            logits = torch.einsum("bsed,vd->bsev", hidden_states, output_weight)
         else:
-            logits = torch.matmul(hidden_states, self.item_embedding.weight.transpose(0, 1))
+            logits = torch.matmul(hidden_states, output_weight.transpose(0, 1))
         return logits
 
     def predict_next(self, sequences, sequence_lengths):
         """Predict next item probabilities.
-        
+
         Returns:
             Non-ensemble: [B, V]
             Ensemble: [B, V] (averaged over ensemble members)
@@ -193,7 +209,7 @@ class MLP4Rec(DeepSequentialModel):
 
     def get_hidden_states(self, sequences, sequence_lengths):
         """Get hidden states with causal pooling + MLP.
-        
+
         Returns:
             Non-ensemble: [B, S, D]
             Ensemble: [B, S, E, D]
@@ -204,10 +220,14 @@ class MLP4Rec(DeepSequentialModel):
         embs = self.get_item_embedding(sequences)
 
         # Add position embeddings
-        positions = torch.arange(seq_len, device=sequences.device).unsqueeze(0).expand(batch_size, -1)
+        positions = (
+            torch.arange(seq_len, device=sequences.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
         positions = torch.clamp(positions, 0, self.config.max_seq_length - 1)
         pos_embs = self.pos_embedding(positions)  # [B, S, D]
-        
+
         if self.is_ensemble:
             # Expand pos_embs to match ensemble dimension
             pos_embs = pos_embs.unsqueeze(2)  # [B, S, 1, D]
@@ -264,14 +284,16 @@ class MLP4Rec(DeepSequentialModel):
             else:
                 batch_size, seq_len, dim = embs.shape
             mask = (sequences != 0).float()  # [B, S]
-            
+
             # Apply learnable recency weights (softmax for normalization)
             recency = torch.softmax(self.recency_weights[:seq_len], dim=0)  # [S]
-            
+
             # Weighted embeddings
             if self.is_ensemble:
                 weighted_embs = embs * recency.view(1, -1, 1, 1)  # [B, S, E, D]
-                masked_embs = weighted_embs * mask.unsqueeze(-1).unsqueeze(-1)  # [B, S, E, D]
+                masked_embs = weighted_embs * mask.unsqueeze(-1).unsqueeze(
+                    -1
+                )  # [B, S, E, D]
             else:
                 weighted_embs = embs * recency.view(1, -1, 1)  # [B, S, D]
                 masked_embs = weighted_embs * mask.unsqueeze(-1)  # [B, S, D]
@@ -282,7 +304,9 @@ class MLP4Rec(DeepSequentialModel):
 
             # Causal weighted mean
             if self.is_ensemble:
-                pooled = cumsum_embs / (cumsum_weights.unsqueeze(-1).unsqueeze(-1) + 1e-9)
+                pooled = cumsum_embs / (
+                    cumsum_weights.unsqueeze(-1).unsqueeze(-1) + 1e-9
+                )
             else:
                 pooled = cumsum_embs / (cumsum_weights.unsqueeze(-1) + 1e-9)
 
@@ -295,9 +319,9 @@ class MLP4Rec(DeepSequentialModel):
 
             for i in range(seq_len):
                 # Max over positions 0..i
-                prefix = embs[:, :i+1, :]  # [B, i+1, D]
-                mask = (sequences[:, :i+1] != 0).unsqueeze(-1)  # [B, i+1, 1]
-                masked_prefix = prefix.masked_fill(~mask, float('-inf'))
+                prefix = embs[:, : i + 1, :]  # [B, i+1, D]
+                mask = (sequences[:, : i + 1] != 0).unsqueeze(-1)  # [B, i+1, 1]
+                masked_prefix = prefix.masked_fill(~mask, float("-inf"))
                 pooled[:, i, :] = masked_prefix.max(dim=1)[0]
 
             return pooled
@@ -319,12 +343,14 @@ class MLP4Rec(DeepSequentialModel):
             pooled = torch.zeros_like(embs)
             for i in range(seq_len):
                 # Attention over positions 0..i
-                scores = attn_scores[:, :i+1]  # [B, i+1]
-                scores = scores.masked_fill(padding_mask[:, :i+1] == 0, float('-inf'))
+                scores = attn_scores[:, : i + 1]  # [B, i+1]
+                scores = scores.masked_fill(
+                    padding_mask[:, : i + 1] == 0, float("-inf")
+                )
                 weights = torch.softmax(scores, dim=-1).unsqueeze(-1)  # [B, i+1, 1]
 
                 # Weighted sum
-                pooled[:, i, :] = (embs[:, :i+1, :] * weights).sum(dim=1)
+                pooled[:, i, :] = (embs[:, : i + 1, :] * weights).sum(dim=1)
 
             return pooled
 
@@ -334,27 +360,29 @@ class MLP4Rec(DeepSequentialModel):
                 batch_size, seq_len, ensemble_size, dim = embs.shape
             else:
                 batch_size, seq_len, dim = embs.shape
-            
+
             # Last item (recency)
             last_pool = embs
-            
+
             # Weighted mean pooling with learnable recency
             mask = (sequences != 0).float()
             recency = torch.softmax(self.recency_weights[:seq_len], dim=0)  # [S]
-            
+
             if self.is_ensemble:
                 weighted_embs = embs * recency.view(1, -1, 1, 1)  # [B, S, E, D]
                 masked_embs = weighted_embs * mask.unsqueeze(-1).unsqueeze(-1)
                 cumsum_embs = torch.cumsum(masked_embs, dim=1)
                 cumsum_weights = torch.cumsum(recency.unsqueeze(0) * mask, dim=1)
-                mean_pool = cumsum_embs / (cumsum_weights.unsqueeze(-1).unsqueeze(-1) + 1e-9)
+                mean_pool = cumsum_embs / (
+                    cumsum_weights.unsqueeze(-1).unsqueeze(-1) + 1e-9
+                )
             else:
                 weighted_embs = embs * recency.view(1, -1, 1)  # [B, S, D]
                 masked_embs = weighted_embs * mask.unsqueeze(-1)
                 cumsum_embs = torch.cumsum(masked_embs, dim=1)
                 cumsum_weights = torch.cumsum(recency.unsqueeze(0) * mask, dim=1)
                 mean_pool = cumsum_embs / (cumsum_weights.unsqueeze(-1) + 1e-9)
-            
+
             # Concatenate last + weighted mean: [B, S, 2*D] or [B, S, E, 2*D]
             return torch.cat([last_pool, mean_pool], dim=-1)
 
@@ -363,14 +391,14 @@ class MLP4Rec(DeepSequentialModel):
 
     def get_item_embedding(self, item_ids: torch.Tensor) -> torch.Tensor:
         """Get embeddings for specific items.
-        
+
         Returns:
             Non-ensemble: [B, S, D]
             Ensemble: [B, S, E, D]
         """
         clamped_ids = torch.clamp(item_ids, 0, self.item_embedding.num_embeddings - 1)
         base_emb = self.item_embedding(clamped_ids)  # [B, S, D]
-        
+
         if self.is_ensemble:
             # Expand to ensemble dimension: [B, S, D] -> [B, S, E, D]
             B, S, D = base_emb.shape
@@ -386,26 +414,28 @@ class MLP4Rec(DeepSequentialModel):
         if not self.is_ensemble:
             # Use parent class implementation for non-ensemble
             return super().compute_loss(batch)
-        
+
         # Ensemble mode: compute loss per member and sum
         sequences = batch["sequence"]
         sequence_lengths = batch["sequence_length"]
-        hidden_states = self.get_hidden_states(sequences, sequence_lengths)  # [B, S, E, D]
-        
+        hidden_states = self.get_hidden_states(
+            sequences, sequence_lengths
+        )  # [B, S, E, D]
+
         targets, mask = self.get_targets_and_mask(batch)
         shifted_targets = targets[:, 1:]
         shifted_mask = mask[:, 1:]
-        
+
         total_loss = 0
         for k in range(self.ensemble_size):
             # Extract k-th ensemble member
             ensemble_k_states = hidden_states[:, :-1, k, :]  # [B, S-1, D]
-            
+
             # Compute logits
             ensemble_k_logits = torch.matmul(
-                ensemble_k_states, self.item_embedding.weight.transpose(0, 1)
+                ensemble_k_states, self.get_output_embeddings().transpose(0, 1)
             )
-            
+
             # Compute loss (same loss function for all members)
             loss_k = self.loss_fn(
                 logits=ensemble_k_logits,
@@ -414,7 +444,7 @@ class MLP4Rec(DeepSequentialModel):
                 neg_items=batch.get("neg_items"),
             )
             total_loss += loss_k
-        
+
         return total_loss
 
     def get_targets_and_mask(self, batch):
@@ -424,7 +454,9 @@ class MLP4Rec(DeepSequentialModel):
 
         targets = sequences
         batch_size, seq_len = sequences.size()
-        mask = torch.zeros(batch_size, seq_len, device=sequences.device, dtype=torch.bool)
+        mask = torch.zeros(
+            batch_size, seq_len, device=sequences.device, dtype=torch.bool
+        )
 
         for i, length in enumerate(sequence_lengths):
             if length > 1:

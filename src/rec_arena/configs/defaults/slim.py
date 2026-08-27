@@ -8,11 +8,11 @@ from ..base import BaseModelConfig
 class SLIMConfig(BaseModelConfig):
     """SLIM configuration with defaults."""
 
-    # Model parameters
+    # Model parameters (SLIMElastic literature defaults, e.g. RecBole).
     num_users: int = None
     num_items: int = None
-    alpha: float = 0.1  # Regularization strength
-    l1_ratio: float = 0.1  # L1 vs L2 ratio (0=L2 only, 1=L1 only)
+    alpha: float = 0.2  # ElasticNet overall regularization strength
+    l1_ratio: float = 0.02  # L1 vs L2 mix (mostly L2 with light sparsity)
 
     def __post_init__(self):
         """Validate configuration."""

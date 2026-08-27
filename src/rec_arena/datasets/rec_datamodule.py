@@ -80,9 +80,12 @@ class RecDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         """Setup datasets with user histories for negative sampling."""
         # Load data (S3Dataset has class-level caching, no need for instance cache)
-        if not hasattr(self.dataset, "interactions_df") or self.dataset.interactions_df is None:
+        if (
+            not hasattr(self.dataset, "interactions_df")
+            or self.dataset.interactions_df is None
+        ):
             self.dataset.load_data()
-        
+
         train_df, val_df, test_df = self.dataset.split()
 
         # Build histories for negative sampling
@@ -103,14 +106,19 @@ class RecDataModule(pl.LightningDataModule):
                 for_val_loo=True,
                 train_df=train_df,
             )
-            # For test data, use train+val combined to build sequences
-            train_val_df = pd.concat([train_df, val_df])
+            # Test input = pure train history with the VAL item appended at the
+            # END (most-recent), matching LOO semantics. We pass val_df via
+            # append_df rather than concatenating it into train_df and
+            # re-sorting -- appending is order-preserving and immune to the
+            # timestamp-tie reordering that misplaced the val item for ~34% of
+            # ml-100k users.
             test_data = prepare_sequences(
                 test_df,
                 self.max_seq_length,
                 self.model_type,
                 for_val_loo=True,
-                train_df=train_val_df,
+                train_df=train_df,
+                append_df=val_df,
             )
 
             self.train_dataset = SequentialDataset(train_data, self.max_seq_length)
@@ -154,6 +162,9 @@ class RecDataModule(pl.LightningDataModule):
             self.val_dataset = ImplicitDataset(val_data)
             self.test_dataset = ImplicitDataset(test_data)
 
+            # Items are 3-indexed after load_data ([3, N+2]; PAD/UNK/MASK=0/1/2),
+            # matching the sequential convention. Negatives sample that same
+            # range (item_offset=3); models size embeddings to N+3.
             self.train_collate = ImplicitNegativeSamplingCollate(
                 self.dataset.num_items,
                 self.num_negatives,

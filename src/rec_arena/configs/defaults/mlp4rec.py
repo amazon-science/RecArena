@@ -16,7 +16,7 @@ class MLP4RecConfig(BaseModelConfig):
     dropout_rate: float = 0.2
     max_seq_length: int = 200
     vocab_size: int = None
-    
+
     # Ensemble
     ensemble_size: int = 1  # 1 = no ensemble, >1 = batch ensemble
 
@@ -25,7 +25,7 @@ class MLP4RecConfig(BaseModelConfig):
 
     # Training
     lr: float = 1e-03
-    weight_decay: float = 1e-05
+    weight_decay: float = 1e-06  # unified neural-baseline weight decay
 
     # Loss function
     loss_type: str = "cross_entropy"

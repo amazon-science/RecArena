@@ -12,10 +12,12 @@ class BPRMFConfig(BaseModelConfig):
     # Architecture
     embedding_dim: int = 64
 
-    # Training - CRITICAL: Proper regularization for BPR-MF convergence
+    # Training. Homogeneous neural-baseline lr=1e-3. BPR-MF regularizes the
+    # user+positive-item embeddings inside the loss (reg_weight) rather than via
+    # optimizer weight_decay, which is the standard BPR formulation.
     reg_weight: float = 0.0001  # L2 regularization in BPR loss (only user+pos_item)
-    lr: float = 0.01  # Higher LR for faster convergence with BPR
-    weight_decay: float = 0.0  # Set to 0.0 - use reg_weight in BPR loss instead
+    lr: float = 1e-03
+    weight_decay: float = 0.0  # in-loss reg_weight is used instead
 
     # Loss function
     loss_type: str = "bpr"
@@ -32,15 +34,11 @@ class BPRMFConfig(BaseModelConfig):
     # Set during training
     num_users: Optional[int] = None
     num_items: Optional[int] = None
-    
+
     # Embedding configuration
     user_embedding_config: dict = None
     item_embedding_config: dict = None
 
-    
-    # Embedding configuration
-    user_embedding_config: dict = None
-    item_embedding_config: dict = None
     def __post_init__(self):
         """Validate configuration."""
         if self.val_k_values is None:

@@ -14,7 +14,11 @@ class ItemKNNConfig(BaseModelConfig):
     k: int = 100  # Number of neighbors
     similarity: str = "cosine"  # 'cosine' or 'jaccard'
     shrinkage: float = 100.0  # Shrinkage parameter for cosine similarity
-    normalize: bool = True  # Normalize similarity scores
+    # Standard item-based CF / RecBole use UNNORMALIZED neighbor weights.
+    # Column-sum normalization is not rank-preserving across target items and
+    # deviates from RecBole, so the default is False. The normalize=True path
+    # remains available for callers who explicitly opt in.
+    normalize: bool = False  # Normalize similarity scores
 
     def __post_init__(self):
         """Validate configuration."""

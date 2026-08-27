@@ -24,7 +24,7 @@ class S3Dataset(BaseDataset):
         self,
         dataset_name: str,
         split_type: Literal["leave_one_out", "random_user_split", "time_split"],
-        s3_bucket: str = "music-ml-berlin-recarena",
+        s3_bucket: str = "example-bucket",
         s3_prefix: str = "recarena",
         cache_dir: Optional[str] = None,
         min_interactions: int = 0,  # Pre-split data already filtered

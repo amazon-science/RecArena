@@ -15,25 +15,26 @@ class NCFConfig(BaseModelConfig):
     dropout_rate: float = 0.2
 
     # Training
-    lr: float = 1e-04
+    lr: float = 1e-03  # unified neural-baseline lr (was 1e-4)
     weight_decay: float = 1e-06
 
     # Validation metrics (optional)
     compute_val_metrics: bool = False
     val_k_values: list = None
 
-    # Loss function
-    loss_type: str = "cross_entropy"  # cross_entropy, bce, sampled_softmax, bpr
+    # Loss function. Implicit models support only bce / bpr (full-softmax
+    # cross_entropy is rejected by the config validator).
+    loss_type: str = "bce"
 
     # Architecture details
     activation: str = "relu"  # relu, gelu, swish, tanh
     use_batch_norm: bool = False
-    init_std: float = 0.1
+    init_std: float = 0.01  # matches RecBole NeuMF embedding init (normal std=0.01)
 
     # Set during training
     num_users: Optional[int] = None
     num_items: Optional[int] = None
-    
+
     # Embedding configuration
     user_embedding_config: dict = None
     item_embedding_config: dict = None
@@ -51,10 +52,10 @@ class NCFConfig(BaseModelConfig):
 
         if not 0 <= self.dropout_rate <= 1:
             raise ValueError("dropout_rate must be between 0 and 1")
-        
+
         # Set default embedding configs
         if self.user_embedding_config is None:
             self.user_embedding_config = {"type": "standard"}
-        
+
         if self.item_embedding_config is None:
             self.item_embedding_config = {"type": "standard"}

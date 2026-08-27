@@ -62,11 +62,13 @@ def _make_sequential_batch(batch_size=4, seq_len=10, num_items=20):
     batch = []
     for i in range(batch_size):
         seq = list(range(3, 3 + seq_len))  # items starting at offset 3
-        batch.append({
-            "user_id": torch.tensor(i, dtype=torch.long),
-            "sequence": torch.tensor(seq, dtype=torch.long),
-            "sequence_length": torch.tensor(seq_len, dtype=torch.long),
-        })
+        batch.append(
+            {
+                "user_id": torch.tensor(i, dtype=torch.long),
+                "sequence": torch.tensor(seq, dtype=torch.long),
+                "sequence_length": torch.tensor(seq_len, dtype=torch.long),
+            }
+        )
     return batch
 
 
@@ -74,10 +76,12 @@ def _make_implicit_batch(batch_size=4, item_offset=3):
     """Build a list of implicit sample dicts suitable for collate functions."""
     batch = []
     for i in range(batch_size):
-        batch.append({
-            "user_id": torch.tensor(i, dtype=torch.long),
-            "item_id": torch.tensor(item_offset + i, dtype=torch.long),
-        })
+        batch.append(
+            {
+                "user_id": torch.tensor(i, dtype=torch.long),
+                "item_id": torch.tensor(item_offset + i, dtype=torch.long),
+            }
+        )
     return batch
 
 
@@ -86,12 +90,14 @@ def _make_graph_batch(batch_size=4, num_items=20, item_offset=3):
     edge_index = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.long)
     batch = []
     for i in range(batch_size):
-        batch.append({
-            "user_id": torch.tensor(i, dtype=torch.long),
-            "item_id": torch.tensor(item_offset + i, dtype=torch.long),
-            "label": torch.tensor(1.0),
-            "edge_index": edge_index,
-        })
+        batch.append(
+            {
+                "user_id": torch.tensor(i, dtype=torch.long),
+                "item_id": torch.tensor(item_offset + i, dtype=torch.long),
+                "label": torch.tensor(1.0),
+                "edge_index": edge_index,
+            }
+        )
     return batch
 
 
@@ -106,7 +112,9 @@ class TestLeaveOneOutSplit:
     def test_users_with_3plus_interactions(self, synthetic_interactions_df):
         """Users with 3+ interactions: last→test, second-to-last→val, rest→train."""
         splitter = LeaveOneOutSplit(min_sequence_length=3)
-        train, val, test = splitter.split(synthetic_interactions_df, NUM_USERS, NUM_ITEMS)
+        train, val, test = splitter.split(
+            synthetic_interactions_df, NUM_USERS, NUM_ITEMS
+        )
 
         for uid in range(NUM_USERS):
             user_rows = synthetic_interactions_df[
@@ -124,10 +132,12 @@ class TestLeaveOneOutSplit:
 
     def test_user_with_2_interactions(self):
         """User with exactly 2 interactions: last→test, first→train, no val."""
-        df = pd.DataFrame([
-            {"user_id": 0, "item_id": 1, "timestamp": 1},
-            {"user_id": 0, "item_id": 2, "timestamp": 2},
-        ])
+        df = pd.DataFrame(
+            [
+                {"user_id": 0, "item_id": 1, "timestamp": 1},
+                {"user_id": 0, "item_id": 2, "timestamp": 2},
+            ]
+        )
         splitter = LeaveOneOutSplit(min_sequence_length=3)
         train, val, test = splitter.split(df, 1, 2)
 
@@ -154,7 +164,9 @@ class TestTemporalSplit:
     def test_default_ratios_approximate_proportions(self, synthetic_interactions_df):
         """Default 70/15/15 ratios produce approximately correct proportions."""
         splitter = TemporalSplit()
-        train, val, test = splitter.split(synthetic_interactions_df, NUM_USERS, NUM_ITEMS)
+        train, val, test = splitter.split(
+            synthetic_interactions_df, NUM_USERS, NUM_ITEMS
+        )
 
         total = len(synthetic_interactions_df)
         assert abs(len(train) / total - 0.70) < 0.05
@@ -173,7 +185,9 @@ class TestUserBasedSplit:
     def test_each_user_in_exactly_one_split(self, synthetic_interactions_df):
         """Each user's interactions appear in exactly one split."""
         splitter = UserBasedSplit()
-        train, val, test = splitter.split(synthetic_interactions_df, NUM_USERS, NUM_ITEMS)
+        train, val, test = splitter.split(
+            synthetic_interactions_df, NUM_USERS, NUM_ITEMS
+        )
 
         train_users = set(train["user_id"].unique())
         val_users = set(val["user_id"].unique())
@@ -196,29 +210,41 @@ class TestUserBasedSplit:
         t1, v1, te1 = s1.split(synthetic_interactions_df, NUM_USERS, NUM_ITEMS)
         t2, v2, te2 = s2.split(synthetic_interactions_df, NUM_USERS, NUM_ITEMS)
 
-        pd.testing.assert_frame_equal(t1.reset_index(drop=True), t2.reset_index(drop=True))
-        pd.testing.assert_frame_equal(v1.reset_index(drop=True), v2.reset_index(drop=True))
-        pd.testing.assert_frame_equal(te1.reset_index(drop=True), te2.reset_index(drop=True))
+        pd.testing.assert_frame_equal(
+            t1.reset_index(drop=True), t2.reset_index(drop=True)
+        )
+        pd.testing.assert_frame_equal(
+            v1.reset_index(drop=True), v2.reset_index(drop=True)
+        )
+        pd.testing.assert_frame_equal(
+            te1.reset_index(drop=True), te2.reset_index(drop=True)
+        )
 
 
 class TestGetSplitStrategy:
     """Unit tests for get_split_strategy factory."""
 
-    @pytest.mark.parametrize("name,cls", [
-        ("leave_one_out", LeaveOneOutSplit),
-        ("temporal", TemporalSplit),
-        ("user_based", UserBasedSplit),
-    ])
+    @pytest.mark.parametrize(
+        "name,cls",
+        [
+            ("leave_one_out", LeaveOneOutSplit),
+            ("temporal", TemporalSplit),
+            ("user_based", UserBasedSplit),
+        ],
+    )
     def test_valid_names(self, name, cls):
         strategy = get_split_strategy(name)
         assert isinstance(strategy, cls)
 
-    @pytest.mark.parametrize("alias,cls", [
-        ("loo", LeaveOneOutSplit),
-        ("time", TemporalSplit),
-        ("time_split", TemporalSplit),
-        ("random_user_split", UserBasedSplit),
-    ])
+    @pytest.mark.parametrize(
+        "alias,cls",
+        [
+            ("loo", LeaveOneOutSplit),
+            ("time", TemporalSplit),
+            ("time_split", TemporalSplit),
+            ("random_user_split", UserBasedSplit),
+        ],
+    )
     def test_aliases(self, alias, cls):
         strategy = get_split_strategy(alias)
         assert isinstance(strategy, cls)
@@ -226,7 +252,6 @@ class TestGetSplitStrategy:
     def test_unknown_name_raises(self):
         with pytest.raises(ValueError, match="Unknown split strategy"):
             get_split_strategy("nonexistent_strategy")
-
 
 
 # ===================================================================
@@ -333,11 +358,15 @@ def test_property_user_based_split_reproducible(seed, num_users):
 
     pd.testing.assert_frame_equal(t1.reset_index(drop=True), t2.reset_index(drop=True))
     pd.testing.assert_frame_equal(v1.reset_index(drop=True), v2.reset_index(drop=True))
-    pd.testing.assert_frame_equal(te1.reset_index(drop=True), te2.reset_index(drop=True))
+    pd.testing.assert_frame_equal(
+        te1.reset_index(drop=True), te2.reset_index(drop=True)
+    )
 
 
 # Feature: comprehensive-test-suite, Property 14: get_split_strategy rejects unknown names
-@given(name=st.text(min_size=1, max_size=30).filter(lambda s: s not in SPLIT_STRATEGIES))
+@given(
+    name=st.text(min_size=1, max_size=30).filter(lambda s: s not in SPLIT_STRATEGIES)
+)
 @settings(max_examples=100)
 def test_property_get_split_strategy_rejects_unknown(name):
     """Property 14: Unknown strategy names raise ValueError."""
@@ -355,11 +384,13 @@ class TestPrepareSequences:
 
     def test_padding_to_max_seq_length(self):
         """Sequences are padded to max_seq_length with zeros."""
-        df = pd.DataFrame([
-            {"user_id": 0, "item_id": 1, "timestamp": 1},
-            {"user_id": 0, "item_id": 2, "timestamp": 2},
-            {"user_id": 0, "item_id": 3, "timestamp": 3},
-        ])
+        df = pd.DataFrame(
+            [
+                {"user_id": 0, "item_id": 1, "timestamp": 1},
+                {"user_id": 0, "item_id": 2, "timestamp": 2},
+                {"user_id": 0, "item_id": 3, "timestamp": 3},
+            ]
+        )
         seqs = prepare_sequences(df, max_seq_length=5)
         assert len(seqs) == 1
         assert len(seqs[0]["sequence"]) == 5
@@ -369,37 +400,52 @@ class TestPrepareSequences:
 
     def test_truncation_to_most_recent(self):
         """When user has more items than max_seq_length, keep most recent."""
-        df = pd.DataFrame([
-            {"user_id": 0, "item_id": i, "timestamp": i} for i in range(1, 12)
-        ])
+        df = pd.DataFrame(
+            [{"user_id": 0, "item_id": i, "timestamp": i} for i in range(1, 12)]
+        )
         seqs = prepare_sequences(df, max_seq_length=5)
         assert len(seqs[0]["sequence"]) == 5
         # Should keep items 7-11 (most recent 5)
         assert seqs[0]["sequence"] == [7, 8, 9, 10, 11]
 
-    def test_gru4rec_target_extraction(self):
-        """model_type='gru4rec': target is last item, excluded from sequence."""
-        df = pd.DataFrame([
-            {"user_id": 0, "item_id": 1, "timestamp": 1},
-            {"user_id": 0, "item_id": 2, "timestamp": 2},
-            {"user_id": 0, "item_id": 3, "timestamp": 3},
-        ])
+    def test_gru4rec_full_sequence_no_truncation(self):
+        """model_type='gru4rec': full sequence, NO separate target / truncation.
+
+        GRU4Rec uses the per-position causal-shift loss (like SASRec), so it
+        must receive the FULL sequence -- the base loss shifts internally and
+        never reads a `target` key. Truncating to items[:-1] + a `target`
+        (Caser's single-next-item convention) discarded the most-recent
+        transition and cost a supervised target/user; that special-case was
+        removed for gru4rec.
+        """
+        df = pd.DataFrame(
+            [
+                {"user_id": 0, "item_id": 1, "timestamp": 1},
+                {"user_id": 0, "item_id": 2, "timestamp": 2},
+                {"user_id": 0, "item_id": 3, "timestamp": 3},
+            ]
+        )
         seqs = prepare_sequences(df, max_seq_length=5, model_type="gru4rec")
-        assert seqs[0]["target"] == 3
-        # Sequence should not contain the target item at a non-padded position
+        # Full sequence retained; no target key (per-position objective).
+        assert "target" not in seqs[0]
         non_padded = [x for x in seqs[0]["sequence"] if x != 0]
-        assert 3 not in non_padded
+        assert non_padded == [1, 2, 3]
+        assert seqs[0]["sequence_length"] == 3
 
     def test_for_val_loo_builds_from_train(self):
         """for_val_loo=True builds sequences from train_df with target from val/test."""
-        train_df = pd.DataFrame([
-            {"user_id": 0, "item_id": 1, "timestamp": 1},
-            {"user_id": 0, "item_id": 2, "timestamp": 2},
-            {"user_id": 0, "item_id": 3, "timestamp": 3},
-        ])
-        val_df = pd.DataFrame([
-            {"user_id": 0, "item_id": 4, "timestamp": 4},
-        ])
+        train_df = pd.DataFrame(
+            [
+                {"user_id": 0, "item_id": 1, "timestamp": 1},
+                {"user_id": 0, "item_id": 2, "timestamp": 2},
+                {"user_id": 0, "item_id": 3, "timestamp": 3},
+            ]
+        )
+        val_df = pd.DataFrame(
+            [
+                {"user_id": 0, "item_id": 4, "timestamp": 4},
+            ]
+        )
         seqs = prepare_sequences(
             val_df, max_seq_length=5, for_val_loo=True, train_df=train_df
         )
@@ -417,9 +463,9 @@ class TestBuildUserHistories:
         assert len(histories) == NUM_USERS
         for uid in range(NUM_USERS):
             expected = set(
-                synthetic_interactions_df[
-                    synthetic_interactions_df["user_id"] == uid
-                ]["item_id"]
+                synthetic_interactions_df[synthetic_interactions_df["user_id"] == uid][
+                    "item_id"
+                ]
             )
             assert histories[uid] == expected
 
@@ -440,8 +486,7 @@ class TestSequentialDataset:
 
     def test_len_returns_correct_count(self):
         seqs = [
-            {"user_id": i, "sequence": [1, 0], "sequence_length": 1}
-            for i in range(7)
+            {"user_id": i, "sequence": [1, 0], "sequence_length": 1} for i in range(7)
         ]
         ds = SequentialDataset(seqs, max_seq_length=2)
         assert len(ds) == 7
@@ -460,9 +505,9 @@ class TestSequentialDataset:
 @settings(max_examples=100)
 def test_property_sequence_padding_truncation(num_items, max_seq):
     """Property 15: Every sequence has exactly max_seq_length elements, zero-padded."""
-    df = pd.DataFrame([
-        {"user_id": 0, "item_id": i, "timestamp": i} for i in range(1, num_items + 1)
-    ])
+    df = pd.DataFrame(
+        [{"user_id": 0, "item_id": i, "timestamp": i} for i in range(1, num_items + 1)]
+    )
     seqs = prepare_sequences(df, max_seq_length=max_seq)
     if len(seqs) == 0:
         return
@@ -478,17 +523,22 @@ def test_property_sequence_padding_truncation(num_items, max_seq):
 @given(num_items=st.integers(min_value=2, max_value=15))
 @settings(max_examples=100)
 def test_property_gru4rec_target(num_items):
-    """Property 16: GRU4Rec target is last item, not in sequence."""
-    df = pd.DataFrame([
-        {"user_id": 0, "item_id": i, "timestamp": i} for i in range(1, num_items + 1)
-    ])
+    """Property 16: GRU4Rec keeps the FULL sequence (per-position loss), no target.
+
+    (Was: 'target is last item, not in sequence' -- that Caser-style truncation
+    was removed for gru4rec because its per-position causal-shift loss uses the
+    whole sequence and never reads a `target`.)
+    """
+    df = pd.DataFrame(
+        [{"user_id": 0, "item_id": i, "timestamp": i} for i in range(1, num_items + 1)]
+    )
     seqs = prepare_sequences(df, max_seq_length=max(num_items, 5), model_type="gru4rec")
     if len(seqs) == 0:
         return
     s = seqs[0]
-    assert s["target"] == num_items  # last item
+    assert "target" not in s
     non_padded = [x for x in s["sequence"] if x != 0]
-    assert s["target"] not in non_padded
+    assert non_padded == list(range(1, num_items + 1))
 
 
 # Feature: comprehensive-test-suite, Property 17: build_user_histories correctness
@@ -513,7 +563,11 @@ def test_property_sequential_dataset_contract(num_seqs):
     """Property 18: __getitem__ returns correct keys as tensors, __len__ matches."""
     max_seq = 5
     seqs = [
-        {"user_id": i, "sequence": list(range(1, max_seq + 1)), "sequence_length": max_seq}
+        {
+            "user_id": i,
+            "sequence": list(range(1, max_seq + 1)),
+            "sequence_length": max_seq,
+        }
         for i in range(num_seqs)
     ]
     ds = SequentialDataset(seqs, max_seq_length=max_seq)
@@ -535,33 +589,44 @@ class TestPrepareImplicitInteractions:
 
     def test_all_rows_when_no_implicit_column(self):
         """All rows treated as positive when no 'implicit' column."""
-        df = pd.DataFrame([
-            {"user_id": 0, "item_id": 1},
-            {"user_id": 0, "item_id": 2},
-            {"user_id": 1, "item_id": 3},
-        ])
+        df = pd.DataFrame(
+            [
+                {"user_id": 0, "item_id": 1},
+                {"user_id": 0, "item_id": 2},
+                {"user_id": 1, "item_id": 3},
+            ]
+        )
         interactions = prepare_implicit_interactions(df)
         assert len(interactions) == 3
 
     def test_filters_to_implicit_eq_1(self):
         """Only rows with implicit==1 are included."""
-        df = pd.DataFrame([
-            {"user_id": 0, "item_id": 1, "implicit": 1},
-            {"user_id": 0, "item_id": 2, "implicit": 0},
-            {"user_id": 1, "item_id": 3, "implicit": 1},
-        ])
+        df = pd.DataFrame(
+            [
+                {"user_id": 0, "item_id": 1, "implicit": 1},
+                {"user_id": 0, "item_id": 2, "implicit": 0},
+                {"user_id": 1, "item_id": 3, "implicit": 1},
+            ]
+        )
         interactions = prepare_implicit_interactions(df)
         assert len(interactions) == 2
 
-    def test_item_id_decremented_by_1(self):
-        """item_id is converted from 1-indexed to 0-indexed."""
-        df = pd.DataFrame([
-            {"user_id": 0, "item_id": 5},
-            {"user_id": 1, "item_id": 10},
-        ])
+    def test_item_id_preserved(self):
+        """item_id is kept as-is (dataset loader already 3-indexes items).
+
+        prepare_implicit_interactions must NOT shift ids: the S3 loader maps
+        items to [3, N+2] (PAD/UNK/MASK = 0/1/2), and positives, negatives, and
+        held-out targets all share that 3-indexed convention.
+        """
+        df = pd.DataFrame(
+            [
+                {"user_id": 0, "item_id": 5},
+                {"user_id": 1, "item_id": 10},
+            ]
+        )
         interactions = prepare_implicit_interactions(df)
-        assert interactions[0]["item_id"] == 4
-        assert interactions[1]["item_id"] == 9
+        assert interactions[0]["item_id"] == 5
+        assert interactions[1]["item_id"] == 10
 
 
 class TestImplicitDataset:
@@ -655,10 +720,12 @@ class TestPopularitySampler:
     """Unit tests for PopularitySampler."""
 
     def test_excludes_positive_items(self):
-        train_df = pd.DataFrame({
-            "user_id": [0] * 10,
-            "item_id": list(range(3, 13)),
-        })
+        train_df = pd.DataFrame(
+            {
+                "user_id": [0] * 10,
+                "item_id": list(range(3, 13)),
+            }
+        )
         sampler = PopularitySampler(
             num_items=20, num_negatives=5, train_df=train_df, item_offset=3
         )
@@ -668,10 +735,12 @@ class TestPopularitySampler:
             assert s not in positives
 
     def test_probability_distribution_sums_to_one(self):
-        train_df = pd.DataFrame({
-            "user_id": [0] * 10,
-            "item_id": list(range(3, 13)),
-        })
+        train_df = pd.DataFrame(
+            {
+                "user_id": [0] * 10,
+                "item_id": list(range(3, 13)),
+            }
+        )
         sampler = PopularitySampler(
             num_items=20, num_negatives=5, train_df=train_df, item_offset=3
         )
@@ -702,10 +771,12 @@ def test_property_samplers_exclude_positives(num_positives, n_samples):
         assert s not in positives
 
     # PopularitySampler
-    train_df = pd.DataFrame({
-        "user_id": [0] * num_items,
-        "item_id": list(range(item_offset, item_offset + num_items)),
-    })
+    train_df = pd.DataFrame(
+        {
+            "user_id": [0] * num_items,
+            "item_id": list(range(item_offset, item_offset + num_items)),
+        }
+    )
     ps = PopularitySampler(
         num_items=num_items, num_negatives=5, train_df=train_df, item_offset=item_offset
     )
@@ -730,10 +801,12 @@ def test_property_uniform_sampler_count(n):
 def test_property_popularity_sampler_probs_sum(num_items):
     """Property 25: PopularitySampler probability distribution sums to 1.0."""
     item_offset = 3
-    train_df = pd.DataFrame({
-        "user_id": [0] * num_items,
-        "item_id": list(range(item_offset, item_offset + num_items)),
-    })
+    train_df = pd.DataFrame(
+        {
+            "user_id": [0] * num_items,
+            "item_id": list(range(item_offset, item_offset + num_items)),
+        }
+    )
     sampler = PopularitySampler(
         num_items=num_items, num_negatives=5, train_df=train_df, item_offset=item_offset
     )
@@ -850,25 +923,37 @@ def test_property_collate_output_shapes(batch_size, num_neg, seq_len):
     num_items = 30
 
     # SequentialNegativeSamplingCollate → [batch, seq_len, num_neg]
-    seq_collate = SequentialNegativeSamplingCollate(num_items=num_items, num_negatives=num_neg)
-    seq_batch = _make_sequential_batch(batch_size=batch_size, seq_len=seq_len, num_items=num_items)
+    seq_collate = SequentialNegativeSamplingCollate(
+        num_items=num_items, num_negatives=num_neg
+    )
+    seq_batch = _make_sequential_batch(
+        batch_size=batch_size, seq_len=seq_len, num_items=num_items
+    )
     seq_result = seq_collate(seq_batch)
     assert seq_result["neg_items"].shape == (batch_size, seq_len, num_neg)
 
     # ImplicitNegativeSamplingCollate → [batch, num_neg]
-    imp_collate = ImplicitNegativeSamplingCollate(num_items=num_items, num_negatives=num_neg)
+    imp_collate = ImplicitNegativeSamplingCollate(
+        num_items=num_items, num_negatives=num_neg
+    )
     imp_batch = _make_implicit_batch(batch_size=batch_size)
     imp_result = imp_collate(imp_batch)
     assert imp_result["neg_items"].shape == (batch_size, num_neg)
 
     # BatchSharedNegativeSamplingCollate → [batch, num_neg]
-    bs_collate = BatchSharedNegativeSamplingCollate(num_items=num_items, num_negatives=num_neg)
-    bs_batch = _make_sequential_batch(batch_size=batch_size, seq_len=seq_len, num_items=num_items)
+    bs_collate = BatchSharedNegativeSamplingCollate(
+        num_items=num_items, num_negatives=num_neg
+    )
+    bs_batch = _make_sequential_batch(
+        batch_size=batch_size, seq_len=seq_len, num_items=num_items
+    )
     bs_result = bs_collate(bs_batch)
     assert bs_result["neg_items"].shape == (batch_size, num_neg)
 
     # GraphNegativeSamplingCollate → [batch, num_neg]
-    gr_collate = GraphNegativeSamplingCollate(num_items=num_items, num_negatives=num_neg)
+    gr_collate = GraphNegativeSamplingCollate(
+        num_items=num_items, num_negatives=num_neg
+    )
     gr_batch = _make_graph_batch(batch_size=batch_size, num_items=num_items)
     gr_result = gr_collate(gr_batch)
     assert gr_result["neg_items"].shape == (batch_size, num_neg)
@@ -885,13 +970,17 @@ def test_property_collate_negatives_exclude_history(batch_size, num_neg):
     num_items = 30
     item_offset = 3
     # Build user histories with a few positives each
-    user_histories = {i: {item_offset + i, item_offset + i + 1} for i in range(batch_size)}
+    user_histories = {
+        i: {item_offset + i, item_offset + i + 1} for i in range(batch_size)
+    }
 
     # Test with SequentialNegativeSamplingCollate
     collate = SequentialNegativeSamplingCollate(
         num_items=num_items, num_negatives=num_neg, user_histories=user_histories
     )
-    batch = _make_sequential_batch(batch_size=batch_size, seq_len=5, num_items=num_items)
+    batch = _make_sequential_batch(
+        batch_size=batch_size, seq_len=5, num_items=num_items
+    )
     result = collate(batch)
     for i in range(batch_size):
         negs = result["neg_items"][i].flatten().tolist()
@@ -1022,6 +1111,7 @@ class TestDatasetCache:
 def test_property_cache_round_trip(data, key_val):
     """Property 30: set followed by get returns equal data."""
     import tempfile
+
     with tempfile.TemporaryDirectory() as td:
         cache = DatasetCache(cache_dir=td)
         cache.set(data, key=key_val)
@@ -1035,6 +1125,7 @@ def test_property_cache_round_trip(data, key_val):
 def test_property_cache_miss_none(key_val):
     """Property 31: get with uncached kwargs returns None."""
     import tempfile
+
     with tempfile.TemporaryDirectory() as td:
         cache = DatasetCache(cache_dir=td)
         assert cache.get(key=key_val) is None
@@ -1050,6 +1141,7 @@ def test_property_cache_miss_none(key_val):
 def test_property_cache_key_order_independent(a, b, c):
     """Property 32: Cache key is the same regardless of kwarg order."""
     import tempfile
+
     with tempfile.TemporaryDirectory() as td:
         cache = DatasetCache(cache_dir=td)
         key1 = cache._get_cache_key(a=a, b=b, c=c)
@@ -1071,7 +1163,12 @@ from unittest.mock import MagicMock
 
 from rec_arena.datasets.graph_dataset import GraphDataset, to_graph
 from rec_arena.datasets.traditional_datamodule import TraditionalDataModule
-from rec_arena.datasets.constants import PAD_TOKEN, MASK_TOKEN, UNK_TOKEN, FIRST_ITEM_ID
+from rec_arena.datasets.constants import (
+    PAD_TOKEN,
+    MASK_TOKEN,
+    UNK_TOKEN,
+    FIRST_ITEM_ID,
+)
 
 
 # ===================================================================
@@ -1116,11 +1213,13 @@ class TestGraphDataset:
 
 class TestToGraph:
     def test_converts_positive_interactions(self):
-        df = pd.DataFrame({
-            "user_id": [0, 1, 2],
-            "item_id": [3, 4, 5],
-            "implicit": [1, 1, 0],
-        })
+        df = pd.DataFrame(
+            {
+                "user_id": [0, 1, 2],
+                "item_id": [3, 4, 5],
+                "implicit": [1, 1, 0],
+            }
+        )
         interactions = to_graph(df)
         assert len(interactions) == 2  # Only positive
         assert interactions[0]["label"] == 1
@@ -1142,21 +1241,27 @@ class TestTraditionalDataModule:
         ds = MagicMock()
         ds.num_users = 5
         ds.num_items = 10
-        train_df = pd.DataFrame({
-            "user_id": [0, 0, 1, 1, 2],
-            "item_id": [1, 2, 3, 4, 5],
-            "rating": [5.0, 4.0, 3.0, 5.0, 2.0],
-        })
-        val_df = pd.DataFrame({
-            "user_id": [0, 1],
-            "item_id": [3, 5],
-            "rating": [4.0, 5.0],
-        })
-        test_df = pd.DataFrame({
-            "user_id": [0, 2],
-            "item_id": [4, 6],
-            "rating": [5.0, 3.0],
-        })
+        train_df = pd.DataFrame(
+            {
+                "user_id": [0, 0, 1, 1, 2],
+                "item_id": [1, 2, 3, 4, 5],
+                "rating": [5.0, 4.0, 3.0, 5.0, 2.0],
+            }
+        )
+        val_df = pd.DataFrame(
+            {
+                "user_id": [0, 1],
+                "item_id": [3, 5],
+                "rating": [4.0, 5.0],
+            }
+        )
+        test_df = pd.DataFrame(
+            {
+                "user_id": [0, 2],
+                "item_id": [4, 6],
+                "rating": [5.0, 3.0],
+            }
+        )
         ds.split.return_value = (train_df, val_df, test_df)
         return ds
 
@@ -1284,7 +1389,9 @@ def _make_df(num_users=5, items_per_user=10):
     rows = []
     for u in range(num_users):
         for rank, i in enumerate(range(items_per_user)):
-            rows.append({"user_id": u + 100, "item_id": i + 200, "timestamp": u * 100 + rank})
+            rows.append(
+                {"user_id": u + 100, "item_id": i + 200, "timestamp": u * 100 + rank}
+            )
     return pd.DataFrame(rows)
 
 
@@ -1329,7 +1436,10 @@ class TestBaseDatasetFilterByMinInteractions:
         # Items need to also have >= 5 interactions to survive
         rows = [{"user_id": 0, "item_id": i, "timestamp": i} for i in range(2)]
         for u in range(1, 6):
-            rows += [{"user_id": u, "item_id": i, "timestamp": u * 100 + i} for i in range(10)]
+            rows += [
+                {"user_id": u, "item_id": i, "timestamp": u * 100 + i}
+                for i in range(10)
+            ]
         df = pd.DataFrame(rows)
         ds = StubDataset(df, min_interactions=5)
         ds.load_data()
@@ -1473,7 +1583,9 @@ class TestLocalDatasetLoadRawData:
             f.write("0,10,5.0,1000\n1,20,4.0,2000\n")
 
         ds = LocalDataset(
-            path, file_format="csv", separator=",",
+            path,
+            file_format="csv",
+            separator=",",
             column_names=["user_id", "item_id", "rating", "timestamp"],
             min_interactions=1,
         )

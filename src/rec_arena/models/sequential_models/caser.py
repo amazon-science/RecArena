@@ -33,6 +33,9 @@ class Caser(DeepSequentialModel):
         >>> logits = model.forward(sequences)
     """
 
+    # compute_loss forms full-vocab logits (dense table gradient) -> no sparse.
+    SUPPORTS_SPARSE = False
+
     def __init__(self, config: CaserConfig):
         super().__init__(config)
         self.save_hyperparameters()
@@ -92,7 +95,7 @@ class Caser(DeepSequentialModel):
         hidden = self.get_hidden_states(sequence, sequence_length)
 
         # Compute logits same way as training
-        logits = torch.matmul(hidden, self.item_embedding.weight.transpose(0, 1))
+        logits = torch.matmul(hidden, self.get_output_embeddings().transpose(0, 1))
 
         return logits
 

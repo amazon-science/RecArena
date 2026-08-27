@@ -31,7 +31,13 @@ class GraphModel(BaseModel, pl.LightningModule):
         # Optional metrics during validation
         self.compute_val_metrics = getattr(config, "compute_val_metrics", False)
         self.val_k_values = getattr(config, "val_k_values", [10])
-        
+        self._metric_calculator = None
+        # Per-user TRAIN-history table [num_users, Lmax] of 3-indexed item ids
+        # (pad 0), populated by the harness via set_eval_history. Used to mask a
+        # user's already-seen items during VALIDATION so the monitored val NDCG
+        # matches the reported (history-masked) test full-sort protocol.
+        self._val_hist_ids = None
+
         # Set up loss function
         self.loss_fn = None
         loss_type = getattr(config, "loss_type", None)
@@ -52,41 +58,58 @@ class GraphModel(BaseModel, pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True, batch_size=batch_size)
         return loss
 
+    def set_eval_history(self, hist_ids):
+        """Register a per-user TRAIN-history table for validation masking.
+
+        hist_ids: LongTensor [num_users, Lmax] of 3-indexed item ids (pad 0).
+        Mirrors DeepModel/SequentialModel.set_eval_history so the harness wires
+        all families identically. TRAIN items only -- never the val target.
+        """
+        self._val_hist_ids = hist_ids
+
     def validation_step(self, batch, batch_idx):
-        """Validation step for Lightning - use ranking metrics instead of cross-entropy loss."""
+        """Validation step: masked full-sort ranking metrics (val_ndcg@10 etc.).
+
+        Masks special-token columns (0/1/2) and each user's already-seen TRAIN
+        history before ranking, mirroring the reported TEST full-sort protocol
+        (core.py) so the monitored val NDCG selects the same epoch the benchmark
+        would reward. Uses the shared MetricCalculator (tie-safe rank), not a
+        raw argsort that assumed a unique, untied target.
+        """
         with torch.no_grad():
-            # Use test_step for proper ranking evaluation
             result = self.test_step(batch, batch_idx)
             predictions = result['predictions']
             targets = result['targets']
-            
-            # Compute ranking-based validation metrics
             batch_size = predictions.size(0)
-            
-            # 1. Hit Rate@10 (most interpretable)
-            _, top10_items = torch.topk(predictions, k=10, dim=1)
-            hits = (top10_items == targets.unsqueeze(1)).any(dim=1).float()
-            hit_rate = hits.mean()
-            
-            # 2. Reciprocal Rank (for validation loss - lower is better)
-            sorted_indices = torch.argsort(predictions, dim=1, descending=True)
-            target_ranks = (sorted_indices == targets.unsqueeze(1)).nonzero(as_tuple=True)[1] + 1
-            reciprocal_ranks = 1.0 / target_ranks.float()
-            mrr = reciprocal_ranks.mean()
-            
-            # Use negative MRR as validation loss (so lower is better for early stopping)
-            val_loss = -mrr
-            
-            # Log multiple metrics
-            self.log("val_loss", val_loss, prog_bar=True, batch_size=batch_size)  # For early stopping
-            self.log("val_hit_rate@10", hit_rate, prog_bar=True, batch_size=batch_size)
-            self.log("val_mrr", mrr, prog_bar=True, batch_size=batch_size)
-            
-            # Debug: Print metrics for first batch
-            if batch_idx == 0:
-                print(f"Val metrics: Hit@10={hit_rate:.4f}, MRR={mrr:.4f}, Loss={val_loss:.6f}")
-            
-            return val_loss
+
+            # Mask special tokens and already-seen TRAIN items (see docstring).
+            if predictions.size(1) >= 3:
+                predictions[:, :3] = float("-inf")
+            if self._val_hist_ids is not None and "user_id" in batch:
+                hist = self._val_hist_ids.to(predictions.device)[batch["user_id"]]
+                hist = hist.clamp_(max=predictions.size(1) - 1)
+                predictions.scatter_(1, hist, float("-inf"))
+                predictions[:, 0] = float("-inf")  # undo PAD-col unmask (pad=0)
+
+            if self._metric_calculator is None:
+                from ..metrics import MetricCalculator
+
+                self._metric_calculator = MetricCalculator(k_values=self.val_k_values)
+            metrics = self._metric_calculator.calculate_all(
+                predictions.detach().cpu(), targets.detach().cpu()
+            )
+            for metric_name, value in metrics.items():
+                self.log(
+                    f"val_{metric_name}",
+                    float(value),
+                    prog_bar=True,
+                    batch_size=batch_size,
+                )
+            # Keep val_loss logged too (some monitors/schedulers may use it), as
+            # -NDCG@10 so lower stays better on that key.
+            ndcg10 = metrics.get("ndcg@10", 0.0)
+            self.log("val_loss", -float(ndcg10), prog_bar=True, batch_size=batch_size)
+            return -float(ndcg10)
 
     def set_graph_data(self, edge_index: torch.Tensor) -> None:
         """Set graph structure for the model."""

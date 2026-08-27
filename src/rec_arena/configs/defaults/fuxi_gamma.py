@@ -14,12 +14,12 @@ class FuXiGammaConfig(BaseModelConfig):
     num_layers: int = 2
     attention_dim: int = 64
     linear_dim: int = 64
-    dropout_rate: float = 0.5
+    dropout_rate: float = 0.2  # aligned with SASRec for a fair baseline
     max_seq_length: int = 200
     vocab_size: int = None
 
     # FFN
-    ffn_multiply: float = 1.0
+    ffn_multiply: float = 4.0
     epsilon: float = 1e-6
     linear_activation: str = "silu"
 
@@ -33,7 +33,7 @@ class FuXiGammaConfig(BaseModelConfig):
 
     # Training
     lr: float = 1e-03
-    weight_decay: float = 1e-05
+    weight_decay: float = 1e-06  # unified neural-baseline weight decay
 
     # Loss function
     loss_type: str = "cross_entropy"

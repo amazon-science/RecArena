@@ -13,6 +13,10 @@ logger = setup_logger(__name__)
 class DeepModel(BaseModel, pl.LightningModule):
     """Base class for deep learning recommendation models using PyTorch Lightning."""
 
+    # Implicit models score via module-forward lookups (sampled bce/bpr), so
+    # their embedding tables are sparse-safe when opted in.
+    SUPPORTS_SPARSE = True
+
     def __init__(self, config: Dict[str, Any]):
         # Validate configuration for implicit models
         validate_config(config, "implicit")
@@ -25,15 +29,46 @@ class DeepModel(BaseModel, pl.LightningModule):
         self.embedding_dim = config.get("embedding_dim", 64)
         self.lr = config.get("lr", 1e-3)
         self.gradient_clip_val = config.get("gradient_clip_val", 1.0)
-        
+
+        # Sparse embedding eligibility. Implicit models (NCF/TwoTower/SimpleX/
+        # BPRMF) always train with sampled losses (bce/bpr) that score via
+        # module-forward lookups, so they are sparse-safe when opted in.
+        # Subclasses read `self._sparse_embeddings` when building their tables.
+        from ..utils.sparse_optim import sparse_embeddings_eligible
+
+        self._sparse_embeddings, _sparse_reason = sparse_embeddings_eligible(
+            config, type(self)
+        )
+        if getattr(config, "sparse_embeddings", False) and not self._sparse_embeddings:
+            import warnings
+
+            warnings.warn(
+                f"sparse_embeddings requested but disabled: {_sparse_reason}. "
+                "Falling back to dense embedding tables.",
+                stacklevel=2,
+            )
+
         # Store embedding configs for subclasses
-        self.user_embedding_config = config.get("user_embedding_config", {"type": "standard"})
-        self.item_embedding_config = config.get("item_embedding_config", {"type": "standard"})
+        self.user_embedding_config = config.get(
+            "user_embedding_config", {"type": "standard"}
+        )
+        self.item_embedding_config = config.get(
+            "item_embedding_config", {"type": "standard"}
+        )
 
         # Optional metrics during validation
         self.compute_val_metrics = config.get("compute_val_metrics", False)
         self.val_k_values = config.get("val_k_values", [10])
         self._metric_calculator = None
+        # Optional per-user TRAIN-history table [num_users, Lmax] of 3-indexed
+        # item ids, populated by the harness (set_eval_history). Used to mask a
+        # user's already-seen items during VALIDATION metric computation so the
+        # val NDCG that drives early stopping / best-checkpoint selection matches
+        # the masked full-sort protocol used at TEST time (and RecBole's masked
+        # valid metric). Without this the monitored signal is deflated/noisy and
+        # selects the wrong checkpoint -- worst on small datasets. None => the
+        # model was not given history (val masks special tokens only).
+        self._val_hist_ids = None
 
         # Set up loss function
         self.loss_fn = None
@@ -50,11 +85,17 @@ class DeepModel(BaseModel, pl.LightningModule):
             self.loss_fn = get_loss_function(config.loss_type, model_type=model_type)
 
     def configure_optimizers(self):
-        """Configure optimizer for Lightning."""
+        """Configure optimizer for Lightning.
+
+        Single AdamW for dense models. When any embedding table is sparse
+        (config.sparse_embeddings on a sampled-loss implicit model), builds
+        SparseAdam (tables) + AdamW (dense) wrapped in HybridOptim so Lightning
+        stays in automatic optimization.
+        """
+        from ..utils.sparse_optim import build_optimizer
+
         weight_decay = self.config.get("weight_decay", 1e-2)
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.lr, weight_decay=weight_decay
-        )
+        optimizer = build_optimizer(self, lr=self.lr, weight_decay=weight_decay)
 
         # Add learning rate scheduler if specified
         scheduler_config = self.config.get("scheduler")
@@ -83,8 +124,20 @@ class DeepModel(BaseModel, pl.LightningModule):
                         optimizer, T_max=self.config.get("max_epochs", 100)
                     )
             elif scheduler_type == "reduce_on_plateau":
+                # Honor the scheduler-config knobs instead of hardcoding
+                # mode/patience/monitor. The harness builds this dict (see
+                # scripts/benchmark/core.py::_scheduler_config) with the SAME
+                # monitor/mode as early stopping (e.g. val_ndcg@10 / max), so LR
+                # decay and stopping track one signal. The previous hardcoded
+                # mode="min"/monitor="val_loss" silently diverged from the
+                # sequential model path and from what the harness configured.
+                plateau_mode = scheduler_config.get("mode", "min")
+                plateau_monitor = scheduler_config.get("monitor", "val_loss")
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer, mode="min", patience=5, factor=0.5
+                    optimizer,
+                    mode=plateau_mode,
+                    patience=scheduler_config.get("patience", 5),
+                    factor=scheduler_config.get("factor", 0.5),
                 )
             else:
                 return optimizer
@@ -94,13 +147,46 @@ class DeepModel(BaseModel, pl.LightningModule):
                 "lr_scheduler": {
                     "scheduler": scheduler,
                     "monitor": (
-                        "val_loss" if scheduler_type == "reduce_on_plateau" else None
+                        plateau_monitor
+                        if scheduler_type == "reduce_on_plateau"
+                        else None
                     ),
                     "interval": "step" if warmup_steps > 0 else "epoch",
                 },
             }
 
         return optimizer
+
+    def configure_gradient_clipping(
+        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
+    ):
+        """Clip gradients, skipping sparse embedding tables.
+
+        Lightning's automatic clipping calls ``linalg_vector_norm`` which has no
+        sparse kernel, so when a table is sparse we clip dense params only.
+        Dense models defer to Lightning's default behavior.
+        """
+        if not getattr(self, "_sparse_embeddings", False):
+            return super().configure_gradient_clipping(
+                optimizer, gradient_clip_val, gradient_clip_algorithm
+            )
+        if gradient_clip_val:
+            from ..utils.sparse_optim import clip_dense_grads_only
+
+            clip_dense_grads_only(
+                self, gradient_clip_val, gradient_clip_algorithm or "norm"
+            )
+
+    def set_eval_history(self, hist_ids):
+        """Register a per-user TRAIN-history table for validation masking.
+
+        hist_ids: LongTensor [num_users, Lmax] of 3-indexed item ids (pad 0).
+        Used only during validation metric computation (see validation_step) so
+        the monitored val NDCG masks already-seen items exactly like the test
+        full-sort eval. Must contain TRAIN items only -- never the val target --
+        or the target would be masked out of its own ranking.
+        """
+        self._val_hist_ids = hist_ids
 
     def training_step(self, batch, batch_idx):
         """Training step for Lightning."""
@@ -137,6 +223,20 @@ class DeepModel(BaseModel, pl.LightningModule):
                 )
                 predictions = predictions.view(batch_size, self.num_items)
 
+            # Mask special tokens (PAD/UNK/MASK = cols 0/1/2) and each user's
+            # already-seen TRAIN items, mirroring the TEST full-sort protocol
+            # (core.py) and RecBole's masked valid metric. Without this the val
+            # NDCG that drives early stopping + best-checkpoint selection is a
+            # deflated, noisy signal that disagrees with the reported test
+            # metric -- selecting the wrong epoch, worst on small datasets.
+            if predictions.size(1) >= 3:
+                predictions[:, :3] = float("-inf")
+            if self._val_hist_ids is not None:
+                hist = self._val_hist_ids.to(predictions.device)[user_ids]
+                hist = hist.clamp_(max=predictions.size(1) - 1)
+                predictions.scatter_(1, hist, float("-inf"))
+                predictions[:, 0] = float("-inf")  # undo PAD-col unmask (pad=0)
+
             # Compute metrics
             if self._metric_calculator is None:
                 from rec_arena.metrics import MetricCalculator
@@ -165,7 +265,7 @@ class DeepModel(BaseModel, pl.LightningModule):
 
         Note: item_ids are already 0-indexed from the implicit dataset,
         matching the 0-indexed prediction tensor and embeddings.
-        
+
         Returns predictions and targets for consistency with sequential models.
         """
         user_ids = batch["user_id"]
@@ -190,7 +290,9 @@ class DeepModel(BaseModel, pl.LightningModule):
         # Compute accuracy@10
         _, top10 = torch.topk(predictions, k=10, dim=-1)
         acc10 = (top10 == item_ids.unsqueeze(1)).any(dim=1).float().mean()
-        self.log("test_acc@10", float(acc10), on_step=False, on_epoch=True, prog_bar=True)
+        self.log(
+            "test_acc@10", float(acc10), on_step=False, on_epoch=True, prog_bar=True
+        )
 
         # Compute additional metrics
         if self._metric_calculator is None:
@@ -215,7 +317,7 @@ class DeepModel(BaseModel, pl.LightningModule):
         return {
             "predictions": predictions_cpu,
             "targets": targets_cpu,
-            "test_acc@10": acc10
+            "test_acc@10": acc10,
         }
 
     def compute_loss(self, batch) -> torch.Tensor:

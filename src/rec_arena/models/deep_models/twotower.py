@@ -1,4 +1,5 @@
 """Two-Tower recommendation model."""
+
 import torch
 import torch.nn as nn
 from ..deep import DeepModel
@@ -7,25 +8,25 @@ from ...configs.defaults.twotower import TwoTowerConfig
 
 class TwoTower(DeepModel):
     """TwoTower: Dual Encoder Architecture for Retrieval.
-    
+
     A dual encoder model with separate neural networks (towers) for users and items.
     Similarity is computed via dot product in a shared embedding space.
-    
+
     Paper: "Sampling-Bias-Corrected Neural Modeling for Large Corpus Item Recommendations" (RecSys 2019)
     Link: https://research.google/pubs/pub48840/
-    
+
     Model ID: twotower
     Model Type: Implicit Feedback
-    
+
     Key Features:
         - Separate user and item encoders
         - Shared embedding space
         - Efficient for large-scale retrieval
         - Configurable tower architectures
-    
+
     Args:
         config (TwoTowerConfig): Model configuration with tower parameters
-    
+
     Example:
         >>> config = TwoTowerConfig(num_users=1000, num_items=500, embedding_dim=64)
         >>> model = TwoTower(config)
@@ -38,36 +39,44 @@ class TwoTower(DeepModel):
 
         # User tower
         if self.user_embedding_config["type"] == "standard":
-            self.user_embedding = nn.Embedding(self.config.num_users, self.config.embedding_dim)
+            self.user_embedding = nn.Embedding(
+                self.config.num_users,
+                self.config.embedding_dim,
+                sparse=self._sparse_embeddings,
+            )
         else:
             from ...modules.layer_utils.embedding_factory import create_embedding
+
             self.user_embedding = create_embedding(
                 embedding_type=self.user_embedding_config["type"],
                 num_embeddings=self.config.num_users,
                 embedding_dim=self.config.embedding_dim,
-                **self.user_embedding_config.get("kwargs", {})
+                **self.user_embedding_config.get("kwargs", {}),
             )
-        
+
         self.user_tower = self._build_tower(
-            self.config.embedding_dim,
-            self.config.user_tower_dims
+            self.config.embedding_dim, self.config.user_tower_dims
         )
 
         # Item tower
         if self.item_embedding_config["type"] == "standard":
-            self.item_embedding = nn.Embedding(self.config.num_items, self.config.embedding_dim)
+            self.item_embedding = nn.Embedding(
+                self.config.num_items,
+                self.config.embedding_dim,
+                sparse=self._sparse_embeddings,
+            )
         else:
             from ...modules.layer_utils.embedding_factory import create_embedding
+
             self.item_embedding = create_embedding(
                 embedding_type=self.item_embedding_config["type"],
                 num_embeddings=self.config.num_items,
                 embedding_dim=self.config.embedding_dim,
-                **self.item_embedding_config.get("kwargs", {})
+                **self.item_embedding_config.get("kwargs", {}),
             )
-        
+
         self.item_tower = self._build_tower(
-            self.config.embedding_dim,
-            self.config.item_tower_dims
+            self.config.embedding_dim, self.config.item_tower_dims
         )
 
         self._init_weights()
@@ -161,6 +170,6 @@ class TwoTower(DeepModel):
         """Compute loss using implicit loss functions."""
         user_ids = batch["user_id"]
         item_ids = batch["item_id"]
-        
+
         hidden_states = self.get_hidden_states(user_ids, item_ids)
         return self.loss_fn(self, batch, hidden_states)

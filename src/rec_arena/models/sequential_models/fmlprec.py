@@ -13,10 +13,11 @@ class FilterLayer(nn.Module):
     def __init__(self, seq_len, embedding_dim, dropout_rate):
         super().__init__()
         self.seq_len = seq_len
-        
+
         # Exact match to original: 0.02 initialization
         self.complex_weight = nn.Parameter(
-            torch.randn(1, seq_len // 2 + 1, embedding_dim, 2, dtype=torch.float32) * 0.02
+            torch.randn(1, seq_len // 2 + 1, embedding_dim, 2, dtype=torch.float32)
+            * 0.02
         )
         self.dropout = nn.Dropout(dropout_rate)
         self.layer_norm = nn.LayerNorm(embedding_dim, eps=1e-12)
@@ -24,28 +25,43 @@ class FilterLayer(nn.Module):
     def forward(self, input_tensor):
         """FilterLayer with causal masking - processes each position with its causal prefix."""
         batch, seq_len, hidden = input_tensor.shape
-        
+
         # Create all causal prefixes efficiently using broadcasting
         # Create mask: [S, S] where mask[i, j] = 1 if j <= i else 0
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=input_tensor.device, dtype=input_tensor.dtype))
-        
+        causal_mask = torch.tril(
+            torch.ones(
+                seq_len, seq_len, device=input_tensor.device, dtype=input_tensor.dtype
+            )
+        )
+
         # Broadcast and apply: [B, S, H] -> [B, S, S, H] -> [B*S, S, H]
-        causal_batch = (input_tensor.unsqueeze(1) * causal_mask.unsqueeze(0).unsqueeze(-1)).view(batch * seq_len, seq_len, hidden)
-        
+        causal_batch = (
+            input_tensor.unsqueeze(1) * causal_mask.unsqueeze(0).unsqueeze(-1)
+        ).view(batch * seq_len, seq_len, hidden)
+
         # Single FFT call on all causal prefixes
-        x = fft.rfft(causal_batch, dim=1, norm='ortho')
+        x = fft.rfft(causal_batch, dim=1, norm="ortho")
         weight = torch.view_as_complex(self.complex_weight)
         x = x * weight
-        sequence_emb_fft = fft.irfft(x, n=seq_len, dim=1, norm='ortho')
-        
-        # Reshape: [S, B, S, H] and extract diagonal (position i from prefix i)
-        sequence_emb_fft = sequence_emb_fft.view(seq_len, batch, seq_len, hidden)
-        hidden_states = torch.stack([sequence_emb_fft[i, :, i, :] for i in range(seq_len)], dim=1)
-        
+        sequence_emb_fft = fft.irfft(x, n=seq_len, dim=1, norm="ortho")
+
+        # Reshape back to [B, S, S, H] and extract the diagonal (position i read
+        # from the length-i causal prefix). CRITICAL: the flat batch was built as
+        # `view(batch*seq_len, ...)` so its row index is `b*seq_len + i` (batch
+        # OUTER, prefix i INNER). The reshape here MUST use the SAME axis order,
+        # `view(batch, seq_len, seq_len, hidden)`, and extract `[:, i, i, :]`.
+        # A previous `view(seq_len, batch, ...)` transposed the first two axes,
+        # reading flat row `i*batch + b` instead of `b*seq_len + i` -- scrambling
+        # prefixes across users (cross-batch leakage) whenever batch != seq_len.
+        sequence_emb_fft = sequence_emb_fft.view(batch, seq_len, seq_len, hidden)
+        hidden_states = torch.stack(
+            [sequence_emb_fft[:, i, i, :] for i in range(seq_len)], dim=1
+        )
+
         # Dropout and residual
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.layer_norm(hidden_states + input_tensor)
-        
+
         return hidden_states
 
 
@@ -66,10 +82,10 @@ class Intermediate(nn.Module):
         hidden_states = torch.nn.functional.gelu(hidden_states)
         hidden_states = self.dense_2(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        
+
         # Single residual connection
         hidden_states = self.layer_norm(hidden_states + input_tensor)
-        
+
         return hidden_states
 
 
@@ -134,7 +150,7 @@ class FMLPRec(DeepSequentialModel):
         )
 
         # FMLPRec requires learnable position embeddings for frequency filters
-        position_config = getattr(self.config, 'position_config', {"type": "learnable"})
+        position_config = getattr(self.config, "position_config", {"type": "learnable"})
         if position_config["type"] == "rope":
             raise ValueError(
                 "FMLPRec requires learnable position embeddings. "
@@ -148,20 +164,20 @@ class FMLPRec(DeepSequentialModel):
         # LayerNorm for embedding combination (like original)
         self.layer_norm = nn.LayerNorm(self.embedding_dim, eps=1e-12)
         self.dropout = nn.Dropout(self.config.dropout_rate)
-        
+
         # Initialize weights properly
         self._init_weights()
-    
+
     def _init_weights(self):
         """Initialize weights matching original implementation."""
         # Original uses 0.02 std for all embeddings
         nn.init.normal_(self.item_embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.pos_embedding.weight, mean=0.0, std=0.02)
-        
+
         # Initialize layer norm
         nn.init.ones_(self.layer_norm.weight)
         nn.init.zeros_(self.layer_norm.bias)
-        
+
         # Initialize all linear layers
         for module in self.modules():
             if isinstance(module, nn.Linear):
@@ -178,7 +194,7 @@ class FMLPRec(DeepSequentialModel):
         hidden = self.get_hidden_states(sequence, sequence_length)
 
         # Compute logits same way as training
-        logits = torch.matmul(hidden, self.item_embedding.weight.transpose(0, 1))
+        logits = torch.matmul(hidden, self.get_output_embeddings().transpose(0, 1))
 
         return logits
 
@@ -202,7 +218,7 @@ class FMLPRec(DeepSequentialModel):
         )
         pos_embs = self.pos_embedding(positions)
         x = item_embs + pos_embs
-        
+
         # CRITICAL: Apply LayerNorm + Dropout after embedding combination (like original)
         x = self.layer_norm(x)
         x = self.dropout(x)

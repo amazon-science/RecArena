@@ -40,9 +40,24 @@ class SASRecConfig(BaseModelConfig):
     use_ligr: bool = False  # Use gated residuals + SwiGLU (LiGR style)
     use_rms_norm: bool = False  # Use RMSNorm instead of LayerNorm (LLaMA style)
     layer_norm_first: bool = True  # True=pre-norm (stable), False=post-norm (faster)
+    # Incremental ablation add-ons (evaluated on top of the RoPE+LiGR anchor).
+    use_qk_norm: bool = False  # RMSNorm on Q,K before attention (Gemma2/Qwen)
+    use_peri_norm: bool = False  # Sandwich/peri-norm: norm sublayer in AND out
     scale_embeddings: bool = True  # Scale embeddings by sqrt(d) for better gradients
     init_std: float = 0.01
-    use_bias: bool = True
+    use_bias: bool = False  # Bias on attention/FFN linears. Default False =
+    # GPT/LLaMA bias-free convention (the codebase's long-standing behavior; the
+    # field was previously dead and hardcoded off). Set True to match
+    # bias-carrying SASRec implementations (original/RecBole) for exact
+    # equivalence checks.
+
+    # --- RecBole-faithful toggles (all default to current RecArena behavior) ---
+    # RecBole SASRec applies a LayerNorm to (item+position) embeddings BEFORE the
+    # encoder and has NO final LayerNorm; RecArena does the opposite (no input
+    # LN, a final LN). These let a run reproduce RecBole's exact norm placement.
+    input_layer_norm: bool = False  # LayerNorm on input embeddings (RecBole: True)
+    final_layer_norm: bool = True  # LayerNorm after the blocks (RecBole: False)
+    layer_norm_eps: float = 1e-5  # norm eps everywhere (RecBole SASRec: 1e-12)
     
     # Embedding configuration
     embedding_config: dict = None
