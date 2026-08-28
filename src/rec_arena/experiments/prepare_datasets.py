@@ -97,6 +97,12 @@ DATASETS = {
         "parser": "parse_twitch",
         "note": "Twitch data must be obtained from https://clivecast.github.io/",
     },
+    "netflix": {
+        "url": None,  # Requires manual download (Netflix Prize licensing)
+        "kcore": 5,
+        "parser": "parse_netflix",
+        "note": "Netflix Prize data must be obtained manually (e.g. https://archive.org/details/nf_prize_dataset.tar or Kaggle 'netflix-prize-data') due to licensing.",
+    },
 }
 
 
@@ -226,6 +232,15 @@ def parse_twitch(cache_dir):
     )
 
 
+def parse_netflix(cache_dir):
+    raise NotImplementedError(
+        "Netflix Prize requires manual download due to licensing. Please obtain "
+        "the data (e.g. https://archive.org/details/nf_prize_dataset.tar or the "
+        "Kaggle 'netflix-prize-data' release) and place the ratings files in "
+        + str(cache_dir)
+    )
+
+
 PARSERS = {
     "parse_ml100k": parse_ml100k,
     "parse_ml1m": parse_ml1m,
@@ -236,6 +251,7 @@ PARSERS = {
     "parse_ratebeer": parse_ratebeer,
     "parse_goodreads": parse_goodreads,
     "parse_twitch": parse_twitch,
+    "parse_netflix": parse_netflix,
 }
 
 

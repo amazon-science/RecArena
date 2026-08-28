@@ -8,6 +8,7 @@ Tests sampled softmax with:
 Metrics reported at k = 10, 20, 50.
 """
 
+import argparse
 import os
 
 import tempfile
@@ -146,7 +147,11 @@ def run_experiment(
     label = f"{scope}|{strategy}|neg={num_negatives}"
     print(f"\n{'='*60}\nDataset: {dataset_name}  Config: {label}\n{'='*60}")
 
-    dataset = S3Dataset(dataset_name=dataset_name, split_type="leave_one_out")
+    dataset = S3Dataset(
+        dataset_name=dataset_name,
+        split_type="leave_one_out",
+        s3_bucket=os.environ.get("RECARENA_S3_BUCKET"),
+    )
     dataset.load_data()
 
     if num_negatives >= dataset.num_items:
@@ -229,9 +234,14 @@ def run_experiment(
     train_time = time.time() - start_time
 
     best_path = checkpoint_callback.best_model_path
-    test_results = trainer.test(
-        model, dm, ckpt_path=best_path if best_path else None, verbose=False
-    )
+    if best_path:
+        # PyTorch >= 2.6 defaults torch.load to weights_only=True; allowlist the
+        # config object so the best checkpoint can be reloaded before testing.
+        torch.serialization.add_safe_globals([SASRecConfig])
+        best_model = SASRec.load_from_checkpoint(best_path, config=config)
+        test_results = trainer.test(best_model, dm, verbose=False)
+    else:
+        test_results = trainer.test(model, dm, verbose=False)
 
     return {
         "dataset": dataset_name,
@@ -257,17 +267,32 @@ def append_result(csv_path: Path, result: dict):
 
 
 def main():
-    output_dir = Path(__file__).parent / "results"
+    parser = argparse.ArgumentParser(description="Negative Sampling Ablation Study")
+    parser.add_argument("--datasets", nargs="+", default=DATASETS)
+    parser.add_argument("--max-epochs", type=int, default=500)
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory (default: experiments/results)",
+    )
+    args = parser.parse_args()
+
+    output_dir = (
+        Path(args.output_dir) if args.output_dir else Path(__file__).parent / "results"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / "negative_sampling_ablation.csv"
     print(f"Results → {csv_path}")
 
-    total = len(DATASETS) * len(CONFIGS)
+    total = len(args.datasets) * len(CONFIGS)
     i = 0
-    for dataset_name, (scope, strategy, num_neg) in product(DATASETS, CONFIGS):
+    for dataset_name, (scope, strategy, num_neg) in product(args.datasets, CONFIGS):
         i += 1
         print(f"\n[{i}/{total}]")
-        result = run_experiment(dataset_name, scope, strategy, num_neg)
+        result = run_experiment(
+            dataset_name, scope, strategy, num_neg, max_epochs=args.max_epochs
+        )
         append_result(csv_path, result)
         ndcg10 = result.get("test_ndcg@10", 0)
         ndcg20 = result.get("test_ndcg@20", 0)

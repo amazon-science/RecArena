@@ -1,6 +1,6 @@
 """Robustness experiments: model size and depth ablation."""
 import argparse, os, time, tempfile
-import numpy as np, pandas as pd, filelock
+import numpy as np, pandas as pd, filelock, torch
 from pathlib import Path
 from lightning import Trainer
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
@@ -56,7 +56,14 @@ def run_exp(dataset_name, arch_config, arch_name, embedding_dim=64, num_layers=2
     
     dm.setup("test")
     best = ckpt_cb.best_model_path
-    res = trainer.test(model, dm, ckpt_path=best if best else None, verbose=False, weights_only=False)
+    if best:
+        # PyTorch >= 2.6 defaults torch.load to weights_only=True; allowlist the
+        # config object so the best checkpoint can be reloaded before testing.
+        torch.serialization.add_safe_globals([SASRecConfig])
+        best_model = SASRec.load_from_checkpoint(best, config=config)
+        res = trainer.test(best_model, dm, verbose=False)
+    else:
+        res = trainer.test(model, dm, verbose=False)
     
     return {
         "dataset": dataset_name, "arch": arch_name, "embedding_dim": embedding_dim,

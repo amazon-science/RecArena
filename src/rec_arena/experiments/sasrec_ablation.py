@@ -18,6 +18,7 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+import torch
 from lightning import Trainer
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 
@@ -44,18 +45,6 @@ LOSS_CONFIGS = {
 }
 
 NEGATIVE_COUNTS = [16, 32, 64, 128, 256, 512, 1024, 2048]
-
-# Already completed - skip these
-COMPLETED = {
-    ('amazon_beauty_2014','bce',16),('amazon_beauty_2014','bce',32),('amazon_beauty_2014','bce',64),('amazon_beauty_2014','bce',128),('amazon_beauty_2014','bce',256),('amazon_beauty_2014','bce',512),('amazon_beauty_2014','bce',1024),('amazon_beauty_2014','bce',2048),('amazon_beauty_2014','cross_entropy',0),('amazon_beauty_2014','gbce',16),('amazon_beauty_2014','gbce',32),('amazon_beauty_2014','gbce',64),('amazon_beauty_2014','gbce',128),('amazon_beauty_2014','gbce',256),('amazon_beauty_2014','gbce',512),('amazon_beauty_2014','gbce',1024),('amazon_beauty_2014','gbce',2048),('amazon_beauty_2014','sampled_softmax',16),('amazon_beauty_2014','sampled_softmax',32),('amazon_beauty_2014','sampled_softmax',64),('amazon_beauty_2014','sampled_softmax',128),('amazon_beauty_2014','sampled_softmax',256),('amazon_beauty_2014','sampled_softmax',512),('amazon_beauty_2014','sampled_softmax',1024),('amazon_beauty_2014','sampled_softmax',2048),
-    ('goodreads','bce',16),('goodreads','bce',32),('goodreads','bce',64),('goodreads','bce',128),('goodreads','bce',256),('goodreads','bce',512),('goodreads','bce',1024),('goodreads','bce',2048),('goodreads','cross_entropy',0),
-    ('ml_100k','bce',16),('ml_100k','bce',32),('ml_100k','bce',64),('ml_100k','bce',128),('ml_100k','bce',256),('ml_100k','bce',512),('ml_100k','bce',1024),('ml_100k','cross_entropy',0),
-    ('ml_1m','bce',16),('ml_1m','bce',32),('ml_1m','bce',64),('ml_1m','bce',128),('ml_1m','bce',256),('ml_1m','bce',512),('ml_1m','bce',1024),('ml_1m','cross_entropy',0),('ml_1m','gbce',16),('ml_1m','gbce',32),('ml_1m','gbce',64),('ml_1m','gbce',128),('ml_1m','gbce',256),('ml_1m','gbce',512),('ml_1m','gbce',1024),('ml_1m','sampled_softmax',16),('ml_1m','sampled_softmax',32),('ml_1m','sampled_softmax',64),('ml_1m','sampled_softmax',128),('ml_1m','sampled_softmax',256),('ml_1m','sampled_softmax',512),('ml_1m','sampled_softmax',1024),
-    ('ml_20m','bce',16),('ml_20m','bce',32),('ml_20m','bce',64),('ml_20m','bce',128),('ml_20m','bce',256),('ml_20m','bce',512),('ml_20m','bce',1024),('ml_20m','bce',2048),('ml_20m','cross_entropy',0),
-    ('netflix','bce',16),('netflix','bce',32),('netflix','bce',64),('netflix','bce',128),('netflix','bce',256),('netflix','cross_entropy',0),
-    ('ratebeer','bce',16),('ratebeer','bce',32),('ratebeer','bce',64),('ratebeer','bce',128),('ratebeer','bce',256),('ratebeer','bce',512),('ratebeer','bce',1024),('ratebeer','bce',2048),('ratebeer','cross_entropy',0),('ratebeer','gbce',16),('ratebeer','gbce',32),('ratebeer','gbce',64),('ratebeer','gbce',128),('ratebeer','gbce',256),('ratebeer','gbce',512),('ratebeer','gbce',1024),('ratebeer','gbce',2048),('ratebeer','sampled_softmax',16),('ratebeer','sampled_softmax',32),('ratebeer','sampled_softmax',64),('ratebeer','sampled_softmax',128),('ratebeer','sampled_softmax',256),('ratebeer','sampled_softmax',512),('ratebeer','sampled_softmax',1024),('ratebeer','sampled_softmax',2048),
-    ('twitch','bce',16),('twitch','bce',32),('twitch','bce',64),('twitch','bce',128),('twitch','bce',256),('twitch','bce',512),('twitch','bce',1024),('twitch','bce',2048),('twitch','cross_entropy',0),('twitch','gbce',16),('twitch','gbce',32),('twitch','gbce',64),('twitch','gbce',128),('twitch','gbce',256),('twitch','gbce',512),('twitch','gbce',1024),('twitch','gbce',2048),('twitch','sampled_softmax',16),('twitch','sampled_softmax',32),('twitch','sampled_softmax',64),('twitch','sampled_softmax',128),('twitch','sampled_softmax',256),('twitch','sampled_softmax',512),('twitch','sampled_softmax',1024),('twitch','sampled_softmax',2048),
-}
 
 # Limit training batches per epoch for large datasets
 MAX_TRAIN_BATCHES = 200
@@ -227,17 +216,15 @@ def run_experiment(
         raise
     train_time = time.time() - start_time
 
-    # Test with best model
+    # Test with best model. Reload the best checkpoint manually (PyTorch >= 2.6
+    # defaults torch.load to weights_only=True, which cannot unpickle the config
+    # object stored in the checkpoint); allowlist SASRecConfig and load explicitly.
     datamodule.setup("test")
     best_path = checkpoint_callback.best_model_path
     if best_path:
-        test_results = trainer.test(
-            model,
-            datamodule,
-            ckpt_path=best_path,
-            verbose=False,
-            weights_only=False,
-        )
+        torch.serialization.add_safe_globals([SASRecConfig])
+        best_model = SASRec.load_from_checkpoint(best_path, config=config)
+        test_results = trainer.test(best_model, datamodule, verbose=False)
     else:
         test_results = trainer.test(model, datamodule, verbose=False)
 
@@ -263,26 +250,40 @@ def run_loss_ablation(
 ):
     """Experiment 1: Loss functions × negative counts."""
 
-    # Build all experiment configs
+    # Build all experiment configs. Full cross-entropy is the reference loss
+    # (no negatives), so it runs once per dataset; the sampling-based losses run
+    # across the full negative-count grid.
     experiments = []
 
+    for ds in datasets:
+        experiments.append(
+            {
+                "dataset_name": ds,
+                "loss_type": "cross_entropy",
+                "num_negatives": 0,
+                "arch_config": ARCH_CONFIGS["baseline"],
+                "arch_name": "baseline",
+                "max_epochs": max_epochs,
+                "device": device,
+            }
+        )
+
     for ds, loss, num_neg in product(datasets, ["bce", "gbce", "sampled_softmax"], NEGATIVE_COUNTS):
-        if (ds, loss, num_neg) not in COMPLETED:
-            experiments.append(
-                {
-                    "dataset_name": ds,
-                    "loss_type": loss,
-                    "num_negatives": num_neg,
-                    "arch_config": ARCH_CONFIGS["baseline"],
-                    "arch_name": "baseline",
-                    "max_epochs": max_epochs,
-                    "device": device,
-                }
-            )
+        experiments.append(
+            {
+                "dataset_name": ds,
+                "loss_type": loss,
+                "num_negatives": num_neg,
+                "arch_config": ARCH_CONFIGS["baseline"],
+                "arch_name": "baseline",
+                "max_epochs": max_epochs,
+                "device": device,
+            }
+        )
     if shard is not None:
         shard_idx, num_shards = shard
         experiments = [e for i, e in enumerate(experiments) if i % num_shards == shard_idx]
-    print(f"Running {len(experiments)} missing experiments (skipping already completed)")
+    print(f"Running {len(experiments)} loss-ablation experiments")
 
     # Run experiments (parallel if multiple GPUs)
     results = _run_experiments_parallel(

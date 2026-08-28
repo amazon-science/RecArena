@@ -49,9 +49,10 @@ python -m rec_arena.experiments.prepare_datasets --list
 
 RateBeer, Goodreads, and Twitch require manual download due to licensing. Run `--list` for instructions.
 
-If using S3, set the environment variable:
+If using S3, set the environment variable to the **bucket name only** (the
+`recarena` prefix is appended automatically):
 ```bash
-export RECARENA_S3_BUCKET="your-bucket/recarena"
+export RECARENA_S3_BUCKET="your-bucket"
 ```
 
 ## Reproducing Paper 1: Architecture Ablation

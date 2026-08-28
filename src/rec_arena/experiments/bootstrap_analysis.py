@@ -158,8 +158,7 @@ def _stream_s3_predictions(s3_path: str):
     keys = [obj["Key"] for obj in resp.get("Contents", []) if obj["Key"].endswith(".npz")]
     print(f"Streaming {len(keys)} files from s3://{bucket}/{prefix}")
 
-    tmp_dir = Path("/home/sagemaker-user/tmp_bootstrap")
-    tmp_dir.mkdir(exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="recarena_bootstrap_"))
 
     for i, key in enumerate(keys):
         fname = Path(key).name
